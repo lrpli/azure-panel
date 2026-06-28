@@ -56,6 +56,8 @@ npm start
 - `AZURE_TENANT_ID`：Azure AD Tenant ID
 - `AZURE_CLIENT_ID`：Service Principal Client ID
 - `AZURE_CLIENT_SECRET`：Service Principal Secret
+- `PERSIST_AZURE_CONFIG`：是否将 Azure 凭据写入本地文件（默认 `true`）
+- `AZURE_RUNTIME_CONFIG_PATH`：本地凭据文件路径（默认 `./.azure-runtime-config.json`）
 - `AUDIT_LOG_PATH`：审计日志文件（默认 `./audit.log`）
 - `HOST` / `PORT`：服务监听地址和端口
 
@@ -66,6 +68,8 @@ npm start
 3. 加载订阅、地区、规格。
 4. 创建 VM 或在列表中执行开关机/重启/删除操作。
 5. 在审计日志查看动作与结果。
+
+说明：如果你在页面里提交过 Azure 凭据，默认会持久化到本地文件，服务重启后无需重复输入。
 
 ## 审计日志
 

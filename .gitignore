@@ -2,3 +2,4 @@
 node_modules/
 *.log
 audit.log
+.azure-runtime-config.json

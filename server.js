@@ -14,6 +14,8 @@ const PANEL_ADMIN_USERNAME = process.env.PANEL_ADMIN_USERNAME || 'admin';
 const PANEL_ADMIN_PASSWORD = process.env.PANEL_ADMIN_PASSWORD || 'admin123456';
 const SESSION_TTL_MS = Math.max(1, Number(process.env.SESSION_TTL_HOURS || 8)) * 60 * 60 * 1000;
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || path.join(__dirname, 'audit.log');
+const AZURE_RUNTIME_CONFIG_PATH = process.env.AZURE_RUNTIME_CONFIG_PATH || path.join(__dirname, '.azure-runtime-config.json');
+const PERSIST_AZURE_CONFIG = String(process.env.PERSIST_AZURE_CONFIG || 'true').toLowerCase() !== 'false';
 const fetchImpl = typeof global.fetch === 'function' ? global.fetch.bind(global) : createCompatFetch();
 
 const runtimeConfig = {
@@ -72,6 +74,7 @@ const DEFAULT_REGIONS = [
   'japaneast'
 ];
 
+loadRuntimeConfigFromDisk();
 loadAuditEntries();
 
 const server = http.createServer(async (req, res) => {
@@ -166,7 +169,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/api/config') {
       return sendJson(res, 200, {
-        configured: Boolean(runtimeConfig.tenantId && runtimeConfig.clientId && runtimeConfig.clientSecret)
+        configured: hasRuntimeConfig(),
+        persisted: PERSIST_AZURE_CONFIG
       });
     }
 
@@ -195,7 +199,8 @@ const server = http.createServer(async (req, res) => {
         actor,
         ip
       });
-      return sendJson(res, 200, { ok: true });
+      persistRuntimeConfigToDisk();
+      return sendJson(res, 200, { ok: true, persisted: PERSIST_AZURE_CONFIG });
     }
 
     if (req.method === 'GET' && url.pathname === '/api/images') {
@@ -683,6 +688,62 @@ function loadEnv(filePath) {
   }
 }
 
+function hasRuntimeConfig() {
+  return Boolean(runtimeConfig.tenantId && runtimeConfig.clientId && runtimeConfig.clientSecret);
+}
+
+function loadRuntimeConfigFromDisk() {
+  if (!PERSIST_AZURE_CONFIG) {
+    return;
+  }
+
+  if (hasRuntimeConfig()) {
+    return;
+  }
+
+  if (!fs.existsSync(AZURE_RUNTIME_CONFIG_PATH)) {
+    return;
+  }
+
+  try {
+    const raw = fs.readFileSync(AZURE_RUNTIME_CONFIG_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    runtimeConfig.tenantId = String(parsed.tenantId || '').trim();
+    runtimeConfig.clientId = String(parsed.clientId || '').trim();
+    runtimeConfig.clientSecret = String(parsed.clientSecret || '').trim();
+  } catch {
+    // Ignore broken persisted config files.
+  }
+}
+
+function persistRuntimeConfigToDisk() {
+  if (!PERSIST_AZURE_CONFIG) {
+    return;
+  }
+
+  if (!hasRuntimeConfig()) {
+    return;
+  }
+
+  const payload = {
+    tenantId: runtimeConfig.tenantId,
+    clientId: runtimeConfig.clientId,
+    clientSecret: runtimeConfig.clientSecret
+  };
+
+  try {
+    fs.writeFileSync(AZURE_RUNTIME_CONFIG_PATH, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    try {
+      fs.chmodSync(AZURE_RUNTIME_CONFIG_PATH, 0o600);
+    } catch {
+      // Ignore chmod failures on limited filesystems.
+    }
+  } catch {
+    // Persistence is best-effort and should not break API response flow.
+  }
+}
+
 function mustQuery(url, key) {
   const value = (url.searchParams.get(key) || '').trim();
   if (!value) {
@@ -898,10 +959,19 @@ async function getVmSizes(subscriptionId, location) {
 
   try {
     const skus = await azureListAll(
-      `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Compute/skus?$filter=location eq '${encodeURIComponent(location)}'&api-version=2024-03-01`
+      `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Compute/skus?api-version=2024-03-01`
     );
     const skuSizes = normalizeSkuVmSizes(skus, normalizedLocation);
-    return { sizes: skuSizes, source: 'skus' };
+    if (skuSizes.length) {
+      return { sizes: skuSizes, source: 'skus' };
+    }
+
+    const discoveredSizes = await discoverVmSizesFromExistingVms(subscriptionId, normalizedLocation);
+    if (discoveredSizes.length) {
+      return { sizes: discoveredSizes, source: 'existing-vms' };
+    }
+
+    return { sizes: [], source: 'skus-empty' };
   } catch (skuError) {
     if (legacyError) {
       const err = new Error(`Failed to load VM sizes from both endpoints. legacy=${legacyError.message}; skus=${skuError.message}`);
@@ -982,6 +1052,14 @@ function isSkuInLocation(sku, normalizedLocation) {
       return true;
     }
   }
+
+  const locationInfo = Array.isArray(sku.locationInfo) ? sku.locationInfo : [];
+  for (const item of locationInfo) {
+    const loc = String(item && item.location ? item.location : '').toLowerCase();
+    if (loc === normalizedLocation) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -996,8 +1074,8 @@ function isSkuRestrictedForSubscription(sku, normalizedLocation) {
       continue;
     }
 
-    if (type !== 'location') {
-      return true;
+    if (type !== 'location' && type !== 'locations') {
+      continue;
     }
 
     if (!values.length) {
@@ -1011,6 +1089,36 @@ function isSkuRestrictedForSubscription(sku, normalizedLocation) {
     }
   }
   return false;
+}
+
+async function discoverVmSizesFromExistingVms(subscriptionId, normalizedLocation) {
+  const payload = await azureRequest({
+    method: 'GET',
+    url: `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Compute/virtualMachines?api-version=2024-03-01`
+  });
+
+  const map = {};
+  const items = Array.isArray(payload.value) ? payload.value : [];
+  for (const vm of items) {
+    const vmLocation = String(vm && vm.location ? vm.location : '').toLowerCase();
+    if (normalizedLocation && vmLocation !== normalizedLocation) {
+      continue;
+    }
+
+    const vmSize = readVmSize(vm);
+    if (!vmSize) {
+      continue;
+    }
+
+    map[vmSize] = {
+      name: vmSize,
+      numberOfCores: 0,
+      memoryInMB: 0,
+      maxDataDiskCount: 0
+    };
+  }
+
+  return sortVmSizes(Object.keys(map).map((key) => map[key]));
 }
 
 function capabilityNumber(capabilities, capabilityName) {

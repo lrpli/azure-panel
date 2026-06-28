@@ -388,7 +388,7 @@ async function loadSizes() {
     return;
   }
 
-  const result = await getVmSizeOptionsForLocation(subscriptionId, location);
+  const result = await getVmSizeOptionsForLocation(subscriptionId, location, { force: true });
 
   fillSelect(
     els.sizeSelect,
@@ -667,13 +667,14 @@ function buildVmTargetSizeSelect(vm) {
   return select;
 }
 
-async function getVmSizeOptionsForLocation(subscriptionId, location) {
+async function getVmSizeOptionsForLocation(subscriptionId, location, options = {}) {
+  const force = Boolean(options.force);
   const key = normalizeLocationKey(location);
   if (!key) {
     return { sizes: [], source: '-' };
   }
 
-  if (state.vmSizesByLocation[key]) {
+  if (!force && state.vmSizesByLocation[key] && state.vmSizesByLocation[key].length) {
     return { sizes: state.vmSizesByLocation[key], source: 'cache' };
   }
 
@@ -682,7 +683,11 @@ async function getVmSizeOptionsForLocation(subscriptionId, location) {
   );
 
   const sizes = Array.isArray(data.sizes) ? data.sizes : [];
-  state.vmSizesByLocation[key] = sizes;
+  if (sizes.length) {
+    state.vmSizesByLocation[key] = sizes;
+  } else {
+    delete state.vmSizesByLocation[key];
+  }
 
   return {
     sizes,
