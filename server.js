@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -13,6 +14,7 @@ const PANEL_ADMIN_USERNAME = process.env.PANEL_ADMIN_USERNAME || 'admin';
 const PANEL_ADMIN_PASSWORD = process.env.PANEL_ADMIN_PASSWORD || 'admin123456';
 const SESSION_TTL_MS = Math.max(1, Number(process.env.SESSION_TTL_HOURS || 8)) * 60 * 60 * 1000;
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || path.join(__dirname, 'audit.log');
+const fetchImpl = typeof global.fetch === 'function' ? global.fetch.bind(global) : createCompatFetch();
 
 const runtimeConfig = {
   tenantId: process.env.AZURE_TENANT_ID || '',
@@ -284,8 +286,8 @@ const server = http.createServer(async (req, res) => {
           name: vm.name,
           resourceGroup: parts.resourceGroup,
           location: vm.location,
-          vmSize: vm.properties?.hardwareProfile?.vmSize || '-',
-          provisioningState: vm.properties?.provisioningState || '-',
+          vmSize: (vm.properties && vm.properties.hardwareProfile && vm.properties.hardwareProfile.vmSize) || '-',
+          provisioningState: (vm.properties && vm.properties.provisioningState) || '-',
           powerState
         };
       });
@@ -427,7 +429,13 @@ const server = http.createServer(async (req, res) => {
           }
         });
 
-        const subnetId = vnet?.properties?.subnets?.[0]?.id ||
+        const subnetId = (
+          vnet &&
+          vnet.properties &&
+          Array.isArray(vnet.properties.subnets) &&
+          vnet.properties.subnets[0] &&
+          vnet.properties.subnets[0].id
+        ) ||
           `/subscriptions/${subscriptionId}/resourceGroups/${resourceGroup}/providers/Microsoft.Network/virtualNetworks/${vnetName}/subnets/${subnetName}`;
 
         const nic = await azureLroRequest({
@@ -669,7 +677,7 @@ function getClientIp(req) {
   if (fwd) {
     return fwd.split(',')[0].trim();
   }
-  return req.socket?.remoteAddress || '';
+  return (req.socket && req.socket.remoteAddress) || '';
 }
 
 function parseCookies(req) {
@@ -772,7 +780,7 @@ function loadAuditEntries() {
 
 function recordAudit({ action, success, actor, ip, details }) {
   const entry = {
-    id: crypto.randomUUID(),
+    id: createAuditId(),
     time: new Date().toISOString(),
     action: String(action || 'unknown'),
     success: Boolean(success),
@@ -789,10 +797,79 @@ function recordAudit({ action, success, actor, ip, details }) {
   fs.appendFile(AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`, () => {});
 }
 
+function createAuditId() {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function createCompatFetch() {
+  return function compatFetch(url, options = {}) {
+    return new Promise((resolve, reject) => {
+      let parsedUrl;
+      try {
+        parsedUrl = new URL(url);
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      const isHttps = parsedUrl.protocol === 'https:';
+      const client = isHttps ? https : http;
+      const method = options.method || 'GET';
+      const headers = options.headers || {};
+
+      const req = client.request(
+        parsedUrl,
+        {
+          method,
+          headers
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          res.on('end', () => {
+            const bodyBuffer = Buffer.concat(chunks);
+            const bodyText = bodyBuffer.toString('utf8');
+            const headerMap = {};
+
+            for (const key in res.headers) {
+              if (!Object.prototype.hasOwnProperty.call(res.headers, key)) {
+                continue;
+              }
+              const value = res.headers[key];
+              headerMap[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : String(value || '');
+            }
+
+            resolve({
+              status: Number(res.statusCode || 0),
+              ok: Number(res.statusCode || 0) >= 200 && Number(res.statusCode || 0) < 300,
+              headers: {
+                get(name) {
+                  return headerMap[String(name || '').toLowerCase()] || null;
+                }
+              },
+              text: async () => bodyText
+            });
+          });
+        }
+      );
+
+      req.on('error', reject);
+
+      if (options.body !== undefined && options.body !== null) {
+        req.write(options.body);
+      }
+      req.end();
+    });
+  };
+}
+
 async function azureRequest({ method, url, body, headers = {}, retry401 = true }) {
   const token = await getAccessToken();
 
-  const response = await fetch(url, {
+  const response = await fetchImpl(url, {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -811,7 +888,11 @@ async function azureRequest({ method, url, body, headers = {}, retry401 = true }
   const json = safeJsonParse(text);
 
   if (!response.ok) {
-    const err = new Error(json?.error?.message || json?.message || `Azure API failed with status ${response.status}.`);
+    const err = new Error(
+      (json && json.error && json.error.message) ||
+      (json && json.message) ||
+      `Azure API failed with status ${response.status}.`
+    );
     err.statusCode = response.status;
     err.details = json || text;
     throw err;
@@ -828,7 +909,7 @@ async function azureRequest({ method, url, body, headers = {}, retry401 = true }
 async function azureLroRequest({ method, url, body }) {
   const token = await getAccessToken();
 
-  let response = await fetch(url, {
+  let response = await fetchImpl(url, {
     method,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -840,7 +921,7 @@ async function azureLroRequest({ method, url, body }) {
   if (response.status === 401) {
     tokenCache = { value: '', expiresAtMs: 0 };
     const retryToken = await getAccessToken();
-    response = await fetch(url, {
+    response = await fetchImpl(url, {
       method,
       headers: {
         Authorization: `Bearer ${retryToken}`,
@@ -854,7 +935,11 @@ async function azureLroRequest({ method, url, body }) {
   const initialJson = safeJsonParse(initialText);
 
   if (!response.ok && response.status !== 202 && response.status !== 201) {
-    const err = new Error(initialJson?.error?.message || initialJson?.message || `Azure API failed with status ${response.status}.`);
+    const err = new Error(
+      (initialJson && initialJson.error && initialJson.error.message) ||
+      (initialJson && initialJson.message) ||
+      `Azure API failed with status ${response.status}.`
+    );
     err.statusCode = response.status;
     err.details = initialJson || initialText;
     throw err;
@@ -876,7 +961,8 @@ async function azureLroRequest({ method, url, body }) {
     await sleep(Math.min(Math.max(retryAfterSec, 1), 15) * 1000);
 
     const poll = await azureRequest({ method: 'GET', url: asyncUrl });
-    const status = String(poll.status || poll.properties?.provisioningState || '').toLowerCase();
+    const pollProvisioningState = poll && poll.properties ? poll.properties.provisioningState : '';
+    const status = String(poll.status || pollProvisioningState || '').toLowerCase();
 
     if (!status && (poll._status === 200 || poll._status === 204)) {
       return initialJson || poll;
@@ -894,7 +980,8 @@ async function azureLroRequest({ method, url, body }) {
     }
 
     if (status === 'failed' || status === 'canceled' || status === 'cancelled') {
-      const err = new Error(`Azure long-running operation failed: ${poll.error?.message || status}`);
+      const pollErrorMessage = poll && poll.error ? poll.error.message : '';
+      const err = new Error(`Azure long-running operation failed: ${pollErrorMessage || status}`);
       err.statusCode = 500;
       err.details = poll;
       throw err;
@@ -929,7 +1016,7 @@ async function getAccessToken() {
     scope: 'https://management.azure.com/.default'
   });
 
-  const response = await fetch(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, {
+  const response = await fetchImpl(`https://login.microsoftonline.com/${encodeURIComponent(tenantId)}/oauth2/v2.0/token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded'
@@ -941,7 +1028,7 @@ async function getAccessToken() {
   const json = safeJsonParse(text);
 
   if (!response.ok) {
-    const err = new Error(json?.error_description || 'Failed to get Azure AD token.');
+    const err = new Error((json && json.error_description) || 'Failed to get Azure AD token.');
     err.statusCode = response.status;
     err.details = json || text;
     throw err;
