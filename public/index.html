@@ -52,6 +52,28 @@
           </div>
         </header>
 
+        <section class="insights-strip">
+          <article class="monitor-card request-card">
+            <div class="monitor-head">
+              <div>
+                <h3>请求记录</h3>
+                <p class="card-desc">单独展示 API 请求状态和耗时，便于快速定位失败请求。</p>
+              </div>
+            </div>
+            <ul id="requestFeed" class="feed-list"></ul>
+          </article>
+
+          <article class="monitor-card event-card">
+            <div class="monitor-head">
+              <div>
+                <h3>系统消息</h3>
+                <p class="card-desc">记录页面内关键提示，不再以右下角悬浮方式打断操作。</p>
+              </div>
+            </div>
+            <ul id="eventFeed" class="feed-list"></ul>
+          </article>
+        </section>
+
         <section class="card auth-card" id="auth-block">
           <h3>登录</h3>
           <p class="card-desc">先登录后才能调用 Azure 管理接口。</p>
@@ -104,6 +126,7 @@
                 地区
                 <select id="locationSelect"></select>
               </label>
+              <p id="locationSelectionHint" class="hint location-hint full">当前地区: 未选择</p>
               <label class="full">
                 机型规格（全局）
                 <select id="sizeSelect"></select>
@@ -285,7 +308,6 @@
       </div>
     </div>
 
-    <aside id="logPanel" class="log"></aside>
     <script src="/app.js"></script>
   </body>
 </html>

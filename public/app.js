@@ -14,6 +14,7 @@ const els = {
   configForm: document.getElementById('configForm'),
   subscriptionSelect: document.getElementById('subscriptionSelect'),
   locationSelect: document.getElementById('locationSelect'),
+  locationSelectionHint: document.getElementById('locationSelectionHint'),
   sizeSelect: document.getElementById('sizeSelect'),
   createVmSizeSelect: document.getElementById('createVmSizeSelect'),
   vmSizeManualInput: document.getElementById('vmSizeManualInput'),
@@ -42,7 +43,8 @@ const els = {
   auditTableBody: document.getElementById('auditTableBody'),
   sizeSourceBadge: document.getElementById('sizeSourceBadge'),
   sizeCountBadge: document.getElementById('sizeCountBadge'),
-  logPanel: document.getElementById('logPanel')
+  requestFeed: document.getElementById('requestFeed'),
+  eventFeed: document.getElementById('eventFeed')
 };
 
 const state = {
@@ -50,8 +52,12 @@ const state = {
   username: '',
   images: [],
   vmSizesByLocation: {},
-  allVms: []
+  allVms: [],
+  requestFeed: [],
+  eventFeed: []
 };
+
+const FEED_LIMIT = 80;
 
 boot().catch((err) => log(err.message || String(err), true));
 
@@ -61,6 +67,9 @@ async function boot() {
   toggleNetworkFields();
   updateSizeMeta('-', 0);
   updateTopChips('-', '-', 0, 0);
+  updateLocationSelectionHint('');
+  renderRequestFeed();
+  renderEventFeed();
 
   await checkAuthState();
   if (state.authenticated) {
@@ -186,7 +195,14 @@ function bindEvents() {
       return;
     }
 
-    updateTopChips(currentSubscription(), els.locationSelect.value || '-', state.allVms.length, state.allVms.length);
+    const location = els.locationSelect.value || '';
+    updateLocationSelectionHint(location);
+    updateTopChips(currentSubscription(), location || '-', state.allVms.length, state.allVms.length);
+    if (location) {
+      log(`已切换地区: ${location}。后续规格查询与创建将按该地区执行。`);
+    } else {
+      log('地区未选择，部分操作将不可用。', true);
+    }
     await loadSizes();
   });
 
@@ -330,6 +346,7 @@ function clearAppData() {
 
   updateSizeMeta('-', 0);
   updateTopChips('-', '-', 0, 0);
+  updateLocationSelectionHint('');
   clearVmTable('请先登录。');
   clearAuditTable('请先登录。');
 }
@@ -377,8 +394,14 @@ async function loadLocations() {
     locations.map((x) => ({ value: x, label: x }))
   );
 
-  updateTopChips(subscriptionId, els.locationSelect.value || '-', state.allVms.length, state.allVms.length);
-  log(`地区加载完成，共 ${locations.length} 个。`);
+  const selectedLocation = els.locationSelect.value || '';
+  updateLocationSelectionHint(selectedLocation);
+  updateTopChips(subscriptionId, selectedLocation || '-', state.allVms.length, state.allVms.length);
+  if (selectedLocation) {
+    log(`地区加载完成，共 ${locations.length} 个。当前地区: ${selectedLocation}。`);
+  } else {
+    log(`地区加载完成，共 ${locations.length} 个。请选择地区。`, true);
+  }
 }
 
 async function loadSizes() {
@@ -704,11 +727,32 @@ function updateTopChips(subscriptionId, location, filteredCount, totalCount) {
   els.topSubscriptionChip.textContent = `订阅: ${sub === '-' ? '-' : shortText(sub, 22)}`;
   els.topLocationChip.textContent = `地区: ${loc}`;
   els.topVmCountChip.textContent = total > 0 ? `VM: ${filtered}/${total}` : 'VM: 0';
+  els.topSubscriptionChip.classList.toggle('active', sub !== '-');
+  els.topLocationChip.classList.toggle('active', loc !== '-');
+  els.topVmCountChip.classList.toggle('active', total > 0);
 }
 
 function updateSizeMeta(source, count) {
   els.sizeSourceBadge.textContent = `规格来源: ${source || '-'}`;
   els.sizeCountBadge.textContent = `数量: ${count || 0}`;
+}
+
+function updateLocationSelectionHint(location) {
+  if (!els.locationSelectionHint || !els.locationSelect) {
+    return;
+  }
+
+  const text = String(location || '').trim();
+  if (!text) {
+    els.locationSelectionHint.textContent = '当前地区: 未选择';
+    els.locationSelectionHint.classList.remove('active');
+    els.locationSelect.classList.remove('field-active');
+    return;
+  }
+
+  els.locationSelectionHint.textContent = `当前地区: ${text}（规格查询、创建 VM 均按此地区）`;
+  els.locationSelectionHint.classList.add('active');
+  els.locationSelect.classList.add('field-active');
 }
 
 function normalizeLocationKey(location) {
@@ -830,6 +874,97 @@ function formatDate(value) {
   return d.toISOString().replace('T', ' ').slice(0, 19);
 }
 
+function formatStamp(value = Date.now()) {
+  return formatDate(new Date(value).toISOString());
+}
+
+function toRequestPath(url) {
+  try {
+    const u = new URL(url, window.location.origin);
+    return `${u.pathname}${u.search || ''}`;
+  } catch (err) {
+    return String(url || '-');
+  }
+}
+
+function recordRequest({ method, url, status, durationMs, ok, message }) {
+  const methodText = String(method || 'GET').toUpperCase();
+  const statusCode = Number(status || 0);
+  const duration = Number(durationMs || 0);
+
+  state.requestFeed.unshift({
+    method: methodText,
+    path: toRequestPath(url),
+    statusText: statusCode > 0 ? String(statusCode) : 'ERR',
+    durationText: `${duration}ms`,
+    stamp: formatStamp(),
+    ok: Boolean(ok),
+    message: String(message || '')
+  });
+
+  state.requestFeed = state.requestFeed.slice(0, FEED_LIMIT);
+  renderRequestFeed();
+}
+
+function renderRequestFeed() {
+  if (!els.requestFeed) {
+    return;
+  }
+
+  els.requestFeed.innerHTML = '';
+
+  if (!state.requestFeed.length) {
+    const li = document.createElement('li');
+    li.className = 'feed-empty';
+    li.textContent = '暂无请求记录。';
+    els.requestFeed.appendChild(li);
+    return;
+  }
+
+  for (const item of state.requestFeed) {
+    const li = document.createElement('li');
+    li.className = `feed-item request-item ${item.ok ? 'ok' : 'error'}`;
+    li.innerHTML = `
+      <span class="feed-badge">${escapeHtml(item.method)}</span>
+      <span class="feed-main">
+        <strong>${escapeHtml(item.path)}</strong>
+        <small>${escapeHtml(item.stamp)}${item.message ? ` · ${escapeHtml(item.message)}` : ''}</small>
+      </span>
+      <span class="feed-tail">${escapeHtml(item.statusText)} · ${escapeHtml(item.durationText)}</span>
+    `;
+    els.requestFeed.appendChild(li);
+  }
+}
+
+function renderEventFeed() {
+  if (!els.eventFeed) {
+    return;
+  }
+
+  els.eventFeed.innerHTML = '';
+
+  if (!state.eventFeed.length) {
+    const li = document.createElement('li');
+    li.className = 'feed-empty';
+    li.textContent = '暂无系统消息。';
+    els.eventFeed.appendChild(li);
+    return;
+  }
+
+  for (const item of state.eventFeed) {
+    const li = document.createElement('li');
+    li.className = `feed-item event-item ${item.isError ? 'error' : 'ok'}`;
+    li.innerHTML = `
+      <span class="feed-level">${item.isError ? 'ERROR' : 'INFO'}</span>
+      <span class="feed-main">
+        <strong>${escapeHtml(item.text)}</strong>
+        <small>${escapeHtml(item.stamp)}</small>
+      </span>
+    `;
+    els.eventFeed.appendChild(li);
+  }
+}
+
 function shortText(text, maxLen) {
   const s = String(text || '');
   if (s.length <= maxLen) {
@@ -843,15 +978,34 @@ function currentSubscription() {
 }
 
 async function api(url, options = {}) {
-  const response = await fetch(url, {
-    method: options.method || 'GET',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
+  const method = options.method || 'GET';
+  const start = Date.now();
+  let response;
+  let data;
 
-  const data = await response.json().catch(() => ({}));
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    });
+    data = await response.json().catch(() => ({}));
+  } catch (err) {
+    const message = err && err.message ? err.message : '网络请求失败';
+    recordRequest({
+      method,
+      url,
+      status: 0,
+      durationMs: Date.now() - start,
+      ok: false,
+      message
+    });
+    log(message, true);
+    throw err;
+  }
+
   if (!response.ok) {
     if (response.status === 401 && !options.allowUnauthorized) {
       setAuthenticated(false, '');
@@ -859,9 +1013,25 @@ async function api(url, options = {}) {
     }
 
     const message = data.error || `请求失败: ${response.status}`;
+    recordRequest({
+      method,
+      url,
+      status: response.status,
+      durationMs: Date.now() - start,
+      ok: false,
+      message
+    });
     log(message, true);
     throw new Error(message);
   }
+
+  recordRequest({
+    method,
+    url,
+    status: response.status,
+    durationMs: Date.now() - start,
+    ok: true
+  });
 
   return data;
 }
@@ -895,9 +1065,13 @@ function escapeHtml(input) {
 }
 
 function log(text, isError = false) {
-  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  const line = `[${stamp}] ${isError ? 'ERROR' : 'INFO '} ${text}`;
-  els.logPanel.textContent = `${line}\n${els.logPanel.textContent}`.slice(0, 18000);
+  state.eventFeed.unshift({
+    stamp: formatStamp(),
+    text: String(text || ''),
+    isError: Boolean(isError)
+  });
+  state.eventFeed = state.eventFeed.slice(0, FEED_LIMIT);
+  renderEventFeed();
 }
 
 async function withBusy(buttonEl, fn) {
