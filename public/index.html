@@ -8,9 +8,10 @@
   </head>
   <body>
     <header class="hero">
-      <div>
-        <h1>Azure VM 可视化控制台</h1>
-        <p>通过 Azure API 管理虚拟机：创建、开机、关机、重启、删除。</p>
+      <div class="hero-copy">
+        <p class="eyebrow">Control Plane</p>
+        <h1>Azure VM 作战控制台</h1>
+        <p>创建、改规格、开关机与审计，全流程可视化。</p>
       </div>
       <div class="hero-actions">
         <span id="authStatus">未登录</span>
@@ -70,6 +71,10 @@
             机型规格
             <select id="sizeSelect"></select>
           </label>
+          <p class="hint status-hint">
+            <span id="sizeSourceBadge">规格来源: -</span>
+            <span id="sizeCountBadge">数量: 0</span>
+          </p>
           <div class="row-actions">
             <button id="loadLocationsBtn" type="button">加载地区</button>
             <button id="loadSizesBtn" type="button">加载规格</button>
@@ -164,6 +169,7 @@
                 <th>规格</th>
                 <th>状态</th>
                 <th>部署状态</th>
+                <th>目标规格</th>
                 <th>操作</th>
               </tr>
             </thead>

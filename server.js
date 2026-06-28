@@ -238,18 +238,10 @@ const server = http.createServer(async (req, res) => {
       const subscriptionId = mustQuery(url, 'subscriptionId');
       const location = mustQuery(url, 'location');
 
-      const payload = await azureRequest({
-        method: 'GET',
-        url: `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Compute/locations/${encodeURIComponent(location)}/vmSizes?api-version=2021-07-01`
-      });
-
+      const sizeResult = await getVmSizes(subscriptionId, location);
       return sendJson(res, 200, {
-        sizes: (payload.value || []).map((x) => ({
-          name: x.name,
-          numberOfCores: x.numberOfCores,
-          memoryInMB: x.memoryInMB,
-          maxDataDiskCount: x.maxDataDiskCount
-        }))
+        sizes: sizeResult.sizes,
+        source: sizeResult.source
       });
     }
 
@@ -301,8 +293,10 @@ const server = http.createServer(async (req, res) => {
       const resourceGroup = required(body.resourceGroup, 'resourceGroup');
       const name = required(body.name, 'name');
       const action = required(body.action, 'action');
+      const requestedVmSize = String(body.vmSize || '').trim();
 
       const baseUrl = `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/resourceGroups/${encodeURIComponent(resourceGroup)}/providers/Microsoft.Compute/virtualMachines/${encodeURIComponent(name)}`;
+      const vmUrl = `${baseUrl}?api-version=2024-03-01`;
 
       if (action === 'delete') {
         const op = await azureLroRequest({
@@ -319,7 +313,44 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, action, operation: op });
       }
 
-      const allowed = new Set(['start', 'powerOff', 'deallocate', 'restart']);
+      if (action === 'resize') {
+        const vmSize = required(requestedVmSize, 'vmSize');
+        const vmInfo = await azureRequest({
+          method: 'GET',
+          url: vmUrl
+        });
+        const oldVmSize = readVmSize(vmInfo);
+
+        const op = await azureLroRequest({
+          method: 'PATCH',
+          url: vmUrl,
+          body: {
+            properties: {
+              hardwareProfile: {
+                vmSize
+              }
+            }
+          }
+        });
+
+        recordAudit({
+          action: 'vm.resize',
+          success: true,
+          actor,
+          ip,
+          details: { subscriptionId, resourceGroup, name, oldVmSize, newVmSize: vmSize }
+        });
+
+        return sendJson(res, 200, {
+          ok: true,
+          action,
+          operation: op,
+          oldVmSize,
+          newVmSize: vmSize
+        });
+      }
+
+      const allowed = new Set(['start', 'powerOff', 'deallocate', 'restart', 'resize']);
       if (!allowed.has(action)) {
         recordAudit({
           action: 'vm.action',
@@ -329,6 +360,34 @@ const server = http.createServer(async (req, res) => {
           details: { subscriptionId, resourceGroup, name, action, reason: 'unsupported_action' }
         });
         return sendJson(res, 400, { error: 'Unsupported action.' });
+      }
+
+      let resizedBeforeStart = false;
+      let oldVmSize = '';
+      let newVmSize = '';
+
+      if (action === 'start' && requestedVmSize) {
+        const vmInfo = await azureRequest({
+          method: 'GET',
+          url: vmUrl
+        });
+        oldVmSize = readVmSize(vmInfo);
+        newVmSize = requestedVmSize;
+
+        if (oldVmSize && oldVmSize !== newVmSize) {
+          await azureLroRequest({
+            method: 'PATCH',
+            url: vmUrl,
+            body: {
+              properties: {
+                hardwareProfile: {
+                  vmSize: newVmSize
+                }
+              }
+            }
+          });
+          resizedBeforeStart = true;
+        }
       }
 
       const op = await azureLroRequest({
@@ -342,7 +401,15 @@ const server = http.createServer(async (req, res) => {
         success: true,
         actor,
         ip,
-        details: { subscriptionId, resourceGroup, name }
+        details: {
+          subscriptionId,
+          resourceGroup,
+          name,
+          requestedVmSize: requestedVmSize || '',
+          resizedBeforeStart,
+          oldVmSize,
+          newVmSize
+        }
       });
       return sendJson(res, 200, { ok: true, action, operation: op });
     }
@@ -802,6 +869,216 @@ function createAuditId() {
     return crypto.randomUUID();
   }
   return crypto.randomBytes(16).toString('hex');
+}
+
+function readVmSize(vmInfo) {
+  if (!vmInfo || !vmInfo.properties || !vmInfo.properties.hardwareProfile) {
+    return '';
+  }
+  return String(vmInfo.properties.hardwareProfile.vmSize || '').trim();
+}
+
+async function getVmSizes(subscriptionId, location) {
+  const normalizedLocation = String(location || '').toLowerCase();
+  let legacyError = null;
+
+  try {
+    const payload = await azureRequest({
+      method: 'GET',
+      url: `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Compute/locations/${encodeURIComponent(location)}/vmSizes?api-version=2021-07-01`
+    });
+
+    const legacySizes = normalizeLegacyVmSizes(payload.value || []);
+    if (legacySizes.length) {
+      return { sizes: legacySizes, source: 'vmSizes' };
+    }
+  } catch (err) {
+    legacyError = err;
+  }
+
+  try {
+    const skus = await azureListAll(
+      `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Compute/skus?$filter=location eq '${encodeURIComponent(location)}'&api-version=2024-03-01`
+    );
+    const skuSizes = normalizeSkuVmSizes(skus, normalizedLocation);
+    return { sizes: skuSizes, source: 'skus' };
+  } catch (skuError) {
+    if (legacyError) {
+      const err = new Error(`Failed to load VM sizes from both endpoints. legacy=${legacyError.message}; skus=${skuError.message}`);
+      err.statusCode = Number(skuError.statusCode || legacyError.statusCode || 500);
+      err.details = {
+        legacy: legacyError.details || legacyError.message,
+        skus: skuError.details || skuError.message
+      };
+      throw err;
+    }
+    throw skuError;
+  }
+}
+
+function normalizeLegacyVmSizes(items) {
+  const out = [];
+  for (const item of items) {
+    const name = String(item && item.name ? item.name : '').trim();
+    if (!name) {
+      continue;
+    }
+    out.push({
+      name,
+      numberOfCores: toNumber(item.numberOfCores),
+      memoryInMB: toNumber(item.memoryInMB),
+      maxDataDiskCount: toNumber(item.maxDataDiskCount)
+    });
+  }
+  return sortVmSizes(dedupeVmSizes(out));
+}
+
+function normalizeSkuVmSizes(items, normalizedLocation) {
+  const out = [];
+
+  for (const sku of items) {
+    const resourceType = String(sku && sku.resourceType ? sku.resourceType : '').toLowerCase();
+    if (resourceType !== 'virtualmachines') {
+      continue;
+    }
+
+    const skuName = String(sku && sku.name ? sku.name : '').trim();
+    if (!skuName) {
+      continue;
+    }
+
+    if (!isSkuInLocation(sku, normalizedLocation)) {
+      continue;
+    }
+
+    if (isSkuRestrictedForSubscription(sku, normalizedLocation)) {
+      continue;
+    }
+
+    const capabilities = Array.isArray(sku.capabilities) ? sku.capabilities : [];
+    const cores = capabilityNumber(capabilities, 'vCPUs');
+    const memoryGB = capabilityNumber(capabilities, 'MemoryGB');
+    const maxDataDiskCount = capabilityNumber(capabilities, 'MaxDataDiskCount');
+
+    out.push({
+      name: skuName,
+      numberOfCores: cores,
+      memoryInMB: memoryGB > 0 ? Math.round(memoryGB * 1024) : 0,
+      maxDataDiskCount
+    });
+  }
+
+  return sortVmSizes(dedupeVmSizes(out));
+}
+
+function isSkuInLocation(sku, normalizedLocation) {
+  if (!normalizedLocation) {
+    return true;
+  }
+
+  const locations = Array.isArray(sku.locations) ? sku.locations : [];
+  for (const loc of locations) {
+    if (String(loc || '').toLowerCase() === normalizedLocation) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isSkuRestrictedForSubscription(sku, normalizedLocation) {
+  const restrictions = Array.isArray(sku.restrictions) ? sku.restrictions : [];
+  for (const restriction of restrictions) {
+    const reasonCode = String(restriction && restriction.reasonCode ? restriction.reasonCode : '').toLowerCase();
+    const type = String(restriction && restriction.type ? restriction.type : '').toLowerCase();
+    const values = Array.isArray(restriction && restriction.values) ? restriction.values : [];
+
+    if (reasonCode !== 'notavailableforsubscription') {
+      continue;
+    }
+
+    if (type !== 'location') {
+      return true;
+    }
+
+    if (!values.length) {
+      return true;
+    }
+
+    for (const value of values) {
+      if (String(value || '').toLowerCase() === normalizedLocation) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function capabilityNumber(capabilities, capabilityName) {
+  const target = String(capabilityName || '').toLowerCase();
+  for (const capability of capabilities) {
+    const name = String(capability && capability.name ? capability.name : '').toLowerCase();
+    if (name !== target) {
+      continue;
+    }
+    return toNumber(capability.value);
+  }
+  return 0;
+}
+
+function dedupeVmSizes(items) {
+  const map = {};
+  for (const item of items) {
+    map[item.name] = item;
+  }
+  return Object.keys(map).map((key) => map[key]);
+}
+
+function sortVmSizes(items) {
+  return items.sort((a, b) => {
+    const ac = toNumber(a.numberOfCores);
+    const bc = toNumber(b.numberOfCores);
+    if (ac !== bc) {
+      return ac - bc;
+    }
+
+    const am = toNumber(a.memoryInMB);
+    const bm = toNumber(b.memoryInMB);
+    if (am !== bm) {
+      return am - bm;
+    }
+
+    return String(a.name).localeCompare(String(b.name));
+  });
+}
+
+function toNumber(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return 0;
+  }
+  return num;
+}
+
+async function azureListAll(initialUrl) {
+  let nextUrl = initialUrl;
+  const all = [];
+  let guard = 0;
+
+  while (nextUrl && guard < 40) {
+    guard += 1;
+    const page = await azureRequest({
+      method: 'GET',
+      url: nextUrl
+    });
+    const values = Array.isArray(page.value) ? page.value : [];
+    for (const item of values) {
+      all.push(item);
+    }
+
+    nextUrl = page.nextLink || '';
+  }
+
+  return all;
 }
 
 function createCompatFetch() {

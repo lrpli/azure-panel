@@ -21,13 +21,16 @@ const els = {
   sshLabel: document.getElementById('sshLabel'),
   nicLabel: document.getElementById('nicLabel'),
   loadAuditBtn: document.getElementById('loadAuditBtn'),
-  auditTableBody: document.getElementById('auditTableBody')
+  auditTableBody: document.getElementById('auditTableBody'),
+  sizeSourceBadge: document.getElementById('sizeSourceBadge'),
+  sizeCountBadge: document.getElementById('sizeCountBadge')
 };
 
 const state = {
   authenticated: false,
   username: '',
-  images: []
+  images: [],
+  vmSizesByLocation: {}
 };
 
 boot().catch((err) => log(err.message || String(err), true));
@@ -36,6 +39,7 @@ async function boot() {
   bindEvents();
   toggleAuthFields();
   toggleNetworkFields();
+  updateSizeMeta('-', 0);
 
   await checkAuthState();
   if (state.authenticated) {
@@ -90,6 +94,7 @@ function bindEvents() {
         method: 'POST',
         body: payload
       });
+      state.vmSizesByLocation = {};
       log('Azure 凭据已保存。');
       await refreshSubscriptions();
       await loadLocations();
@@ -145,6 +150,7 @@ function bindEvents() {
     if (!ensureAuthenticated()) {
       return;
     }
+    state.vmSizesByLocation = {};
     await loadLocations();
     await loadSizes();
     await loadVms();
@@ -178,7 +184,7 @@ function bindEvents() {
         method: 'POST',
         body: payload
       });
-      log(`创建成功: ${result.vm?.name || payload.name}`);
+      log(`创建成功: ${(result.vm && result.vm.name) || payload.name}`);
       await loadVms();
       await loadAudit();
     });
@@ -235,6 +241,8 @@ function clearAppData() {
   fillSelect(els.locationSelect, []);
   fillSelect(els.sizeSelect, []);
   fillSelect(els.imageSelect, []);
+  state.vmSizesByLocation = {};
+  updateSizeMeta('-', 0);
   clearVmTable('请先登录。');
   clearAuditTable('请先登录。');
 }
@@ -254,15 +262,15 @@ async function refreshSubscriptions() {
   const data = await api('/api/subscriptions');
   fillSelect(
     els.subscriptionSelect,
-    data.subscriptions.map((s) => ({ value: s.id, label: `${s.displayName} (${s.id})` }))
+    (data.subscriptions || []).map((s) => ({ value: s.id, label: `${s.displayName} (${s.id})` }))
   );
 
-  if (!data.subscriptions.length) {
+  if (!(data.subscriptions || []).length) {
     log('未找到可用订阅，请检查服务主体权限。', true);
     return;
   }
 
-  log(`订阅加载完成，共 ${data.subscriptions.length} 个。`);
+  log(`订阅加载完成，共 ${(data.subscriptions || []).length} 个。`);
 }
 
 async function loadLocations() {
@@ -274,10 +282,10 @@ async function loadLocations() {
   const data = await api(`/api/locations?subscriptionId=${encodeURIComponent(subscriptionId)}`);
   fillSelect(
     els.locationSelect,
-    data.locations.map((x) => ({ value: x, label: x }))
+    (data.locations || []).map((x) => ({ value: x, label: x }))
   );
 
-  log(`地区加载完成，共 ${data.locations.length} 个。`);
+  log(`地区加载完成，共 ${(data.locations || []).length} 个。`);
 }
 
 async function loadSizes() {
@@ -287,19 +295,18 @@ async function loadSizes() {
     return;
   }
 
-  const data = await api(
-    `/api/vm-sizes?subscriptionId=${encodeURIComponent(subscriptionId)}&location=${encodeURIComponent(location)}`
-  );
+  const result = await getVmSizeOptionsForLocation(subscriptionId, location);
 
   fillSelect(
     els.sizeSelect,
-    data.sizes.map((s) => ({
+    result.sizes.map((s) => ({
       value: s.name,
-      label: `${s.name} | ${s.numberOfCores} vCPU | ${(s.memoryInMB / 1024).toFixed(1)} GB`
+      label: formatSizeLabel(s)
     }))
   );
 
-  log(`规格加载完成，共 ${data.sizes.length} 个。`);
+  updateSizeMeta(result.source, result.sizes.length);
+  log(`规格加载完成，共 ${result.sizes.length} 个（来源: ${result.source}）。`);
 }
 
 async function loadImages() {
@@ -327,29 +334,48 @@ async function loadVms() {
     return;
   }
 
+  await prefetchSizesForVmRows(subscriptionId, rows);
+
   for (const vm of rows) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${escapeHtml(vm.name)}</td>
-      <td>${escapeHtml(vm.resourceGroup || '-')}</td>
-      <td>${escapeHtml(vm.location || '-')}</td>
-      <td>${escapeHtml(vm.vmSize || '-')}</td>
-      <td>${escapeHtml(vm.powerState || '-')}</td>
-      <td>${escapeHtml(vm.provisioningState || '-')}</td>
-      <td>
-        <div class="cell-actions">
-          <button data-action="start">开机</button>
-          <button data-action="powerOff">关机</button>
-          <button data-action="restart">重启</button>
-          <button data-action="deallocate">释放</button>
-          <button data-action="delete" class="danger">删除</button>
-        </div>
-      </td>
-    `;
+    appendCell(tr, vm.name);
+    appendCell(tr, vm.resourceGroup || '-');
+    appendCell(tr, vm.location || '-');
+    appendCell(tr, vm.vmSize || '-');
+    appendCell(tr, vm.powerState || '-');
+    appendCell(tr, vm.provisioningState || '-');
 
-    tr.querySelectorAll('button[data-action]').forEach((btn) => {
+    const targetSizeTd = document.createElement('td');
+    const sizeSelect = buildVmTargetSizeSelect(vm);
+    targetSizeTd.appendChild(sizeSelect);
+    tr.appendChild(targetSizeTd);
+
+    const actionTd = document.createElement('td');
+    const actionWrap = document.createElement('div');
+    actionWrap.className = 'cell-actions';
+
+    const buttons = [
+      { label: '改规格', action: 'resize', className: 'ghost' },
+      { label: '开机', action: 'start' },
+      { label: '关机', action: 'powerOff' },
+      { label: '重启', action: 'restart' },
+      { label: '释放', action: 'deallocate' },
+      { label: '删除', action: 'delete', className: 'danger' }
+    ];
+
+    for (const item of buttons) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = item.label;
+      btn.setAttribute('data-action', item.action);
+      if (item.className) {
+        btn.classList.add(item.className);
+      }
+
       btn.addEventListener('click', async () => {
-        const action = btn.getAttribute('data-action');
+        const action = item.action;
+        const targetVmSize = normalizeTargetVmSize(sizeSelect.value);
+
         if (action === 'delete') {
           const ok = window.confirm(`确定删除虚拟机 ${vm.name} ?`);
           if (!ok) {
@@ -357,27 +383,176 @@ async function loadVms() {
           }
         }
 
+        if (action === 'resize' && !targetVmSize) {
+          log(`请先为 ${vm.name} 选择目标规格。`, true);
+          return;
+        }
+
         await withBusy(btn, async () => {
+          const payload = {
+            subscriptionId,
+            resourceGroup: vm.resourceGroup,
+            name: vm.name,
+            action
+          };
+
+          if ((action === 'start' || action === 'resize') && targetVmSize) {
+            payload.vmSize = targetVmSize;
+          }
+
           await api('/api/vm/action', {
             method: 'POST',
-            body: {
-              subscriptionId,
-              resourceGroup: vm.resourceGroup,
-              name: vm.name,
-              action
-            }
+            body: payload
           });
-          log(`操作成功: ${vm.name} -> ${action}`);
+
+          const sizeSuffix = payload.vmSize ? ` (${payload.vmSize})` : '';
+          log(`操作成功: ${vm.name} -> ${action}${sizeSuffix}`);
           await loadVms();
           await loadAudit();
         });
       });
-    });
 
+      actionWrap.appendChild(btn);
+    }
+
+    actionTd.appendChild(actionWrap);
+    tr.appendChild(actionTd);
     els.vmTableBody.appendChild(tr);
   }
 
   log(`虚拟机加载完成，共 ${rows.length} 台。`);
+}
+
+async function prefetchSizesForVmRows(subscriptionId, rows) {
+  const seen = {};
+  const locations = [];
+
+  for (const vm of rows) {
+    const key = normalizeLocationKey(vm.location);
+    if (!key || seen[key]) {
+      continue;
+    }
+    seen[key] = true;
+    locations.push(vm.location);
+  }
+
+  for (const location of locations) {
+    try {
+      await getVmSizeOptionsForLocation(subscriptionId, location);
+    } catch (err) {
+      log(`地区 ${location} 规格预加载失败: ${err.message || String(err)}`, true);
+    }
+  }
+}
+
+function buildVmTargetSizeSelect(vm) {
+  const select = document.createElement('select');
+  select.className = 'inline-size-select';
+
+  const locationKey = normalizeLocationKey(vm.location);
+  const cached = state.vmSizesByLocation[locationKey] || [];
+  const currentSize = String(vm.vmSize || '').trim();
+  const options = [];
+  const seen = {};
+
+  if (currentSize && currentSize !== '-') {
+    options.push({
+      name: currentSize,
+      numberOfCores: 0,
+      memoryInMB: 0,
+      maxDataDiskCount: 0,
+      synthetic: true
+    });
+    seen[currentSize] = true;
+  }
+
+  for (const item of cached) {
+    if (!item || !item.name || seen[item.name]) {
+      continue;
+    }
+    seen[item.name] = true;
+    options.push(item);
+  }
+
+  if (!options.length) {
+    const emptyOpt = document.createElement('option');
+    emptyOpt.value = '';
+    emptyOpt.textContent = '无可用规格';
+    select.appendChild(emptyOpt);
+    return select;
+  }
+
+  for (const opt of options) {
+    const optionEl = document.createElement('option');
+    optionEl.value = opt.name;
+    optionEl.textContent = opt.synthetic ? `${opt.name} (当前)` : formatSizeLabel(opt);
+    if (opt.name === currentSize) {
+      optionEl.selected = true;
+    }
+    select.appendChild(optionEl);
+  }
+
+  return select;
+}
+
+async function getVmSizeOptionsForLocation(subscriptionId, location) {
+  const key = normalizeLocationKey(location);
+  if (!key) {
+    return { sizes: [], source: '-' };
+  }
+
+  if (state.vmSizesByLocation[key]) {
+    return { sizes: state.vmSizesByLocation[key], source: 'cache' };
+  }
+
+  const data = await api(
+    `/api/vm-sizes?subscriptionId=${encodeURIComponent(subscriptionId)}&location=${encodeURIComponent(location)}`
+  );
+
+  const sizes = Array.isArray(data.sizes) ? data.sizes : [];
+  state.vmSizesByLocation[key] = sizes;
+
+  return {
+    sizes,
+    source: data.source || 'unknown'
+  };
+}
+
+function normalizeLocationKey(location) {
+  return String(location || '').trim().toLowerCase();
+}
+
+function normalizeTargetVmSize(value) {
+  const out = String(value || '').trim();
+  if (!out || out === '-') {
+    return '';
+  }
+  return out;
+}
+
+function formatSizeLabel(size) {
+  const cores = Number(size.numberOfCores || 0);
+  const memoryGb = Number(size.memoryInMB || 0) / 1024;
+  const disk = Number(size.maxDataDiskCount || 0);
+
+  const left = size.name || '-';
+  const right = `${cores || 0} vCPU | ${memoryGb ? memoryGb.toFixed(1) : '0.0'} GB | ${disk || 0} Disk`;
+  return `${left} | ${right}`;
+}
+
+function updateSizeMeta(source, count) {
+  if (els.sizeSourceBadge) {
+    els.sizeSourceBadge.textContent = `规格来源: ${source || '-'}`;
+  }
+  if (els.sizeCountBadge) {
+    els.sizeCountBadge.textContent = `数量: ${count || 0}`;
+  }
+}
+
+function appendCell(tr, value) {
+  const td = document.createElement('td');
+  td.textContent = String(value == null ? '-' : value);
+  tr.appendChild(td);
 }
 
 async function loadAudit() {
@@ -407,7 +582,7 @@ async function loadAudit() {
 function clearVmTable(message) {
   els.vmTableBody.innerHTML = '';
   const tr = document.createElement('tr');
-  tr.innerHTML = `<td colspan="7">${escapeHtml(message)}</td>`;
+  tr.innerHTML = `<td colspan="8">${escapeHtml(message)}</td>`;
   els.vmTableBody.appendChild(tr);
 }
 
