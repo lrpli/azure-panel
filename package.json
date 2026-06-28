@@ -1,0 +1,14 @@
+{
+  "name": "azure-vm-control-panel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Visual dashboard to manage Azure virtual machines with API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

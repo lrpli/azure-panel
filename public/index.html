@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Azure VM 控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <div>
+        <h1>Azure VM 可视化控制台</h1>
+        <p>通过 Azure API 管理虚拟机：创建、开机、关机、重启、删除。</p>
+      </div>
+      <div class="hero-actions">
+        <span id="authStatus">未登录</span>
+        <button id="logoutBtn" type="button">退出登录</button>
+        <button id="refreshAllBtn" class="primary">刷新数据</button>
+      </div>
+    </header>
+
+    <section class="card auth-card">
+      <h2>登录</h2>
+      <form id="loginForm" class="form auth-form">
+        <label>
+          用户名
+          <input name="username" required placeholder="admin" />
+        </label>
+        <label>
+          密码
+          <input name="password" type="password" required placeholder="输入管理密码" />
+        </label>
+        <button class="primary" type="submit">登录</button>
+      </form>
+    </section>
+
+    <main id="appMain" class="grid hidden">
+      <section class="card">
+        <h2>1. Azure 凭据</h2>
+        <form id="configForm" class="form">
+          <label>
+            Tenant ID
+            <input name="tenantId" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+          </label>
+          <label>
+            Client ID
+            <input name="clientId" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+          </label>
+          <label>
+            Client Secret
+            <input name="clientSecret" type="password" required placeholder="应用密钥" />
+          </label>
+          <button class="primary" type="submit">保存并连接</button>
+        </form>
+        <p class="hint">只保存在当前服务进程内存中，不会写入文件。</p>
+      </section>
+
+      <section class="card">
+        <h2>2. 订阅与资源</h2>
+        <div class="form">
+          <label>
+            订阅
+            <select id="subscriptionSelect"></select>
+          </label>
+          <label>
+            地区
+            <select id="locationSelect"></select>
+          </label>
+          <label>
+            机型规格
+            <select id="sizeSelect"></select>
+          </label>
+          <div class="row-actions">
+            <button id="loadLocationsBtn" type="button">加载地区</button>
+            <button id="loadSizesBtn" type="button">加载规格</button>
+            <button id="loadVmsBtn" class="primary" type="button">加载虚拟机</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card wide">
+        <h2>3. 创建新虚拟机</h2>
+        <form id="createVmForm" class="form two-cols">
+          <label>
+            VM 名称
+            <input name="name" required placeholder="demo-vm" pattern="[A-Za-z0-9-]{1,64}" />
+          </label>
+          <label>
+            资源组
+            <input name="resourceGroup" required placeholder="rg-demo" />
+          </label>
+          <label>
+            管理员用户名
+            <input name="adminUsername" required placeholder="azureuser" />
+          </label>
+          <label>
+            镜像
+            <select name="imageId" id="imageSelect"></select>
+          </label>
+
+          <label>
+            认证方式
+            <select name="authType" id="authTypeSelect">
+              <option value="password">密码</option>
+              <option value="ssh">SSH 公钥</option>
+            </select>
+          </label>
+
+          <label id="passwordLabel">
+            管理员密码
+            <input name="adminPassword" type="password" placeholder="至少 12 位" />
+          </label>
+
+          <label id="sshLabel" class="hidden full">
+            SSH 公钥
+            <textarea name="sshPublicKey" rows="3" placeholder="ssh-rsa AAAA..."></textarea>
+          </label>
+
+          <label>
+            网络模式
+            <select name="networkMode" id="networkModeSelect">
+              <option value="auto">自动创建网络资源</option>
+              <option value="existing-nic">使用现有 NIC</option>
+            </select>
+          </label>
+
+          <label id="nicLabel" class="hidden full">
+            现有 NIC 资源 ID
+            <input name="existingNicId" placeholder="/subscriptions/.../networkInterfaces/xxx" />
+          </label>
+
+          <label>
+            VNet 名称（可选）
+            <input name="vnetName" placeholder="vnet-demo" />
+          </label>
+          <label>
+            Subnet 名称（可选）
+            <input name="subnetName" placeholder="default" />
+          </label>
+          <label>
+            地址段（可选）
+            <input name="addressPrefix" placeholder="10.20.0.0/16" />
+          </label>
+          <label>
+            子网段（可选）
+            <input name="subnetPrefix" placeholder="10.20.1.0/24" />
+          </label>
+
+          <div class="full">
+            <button class="primary" type="submit">创建虚拟机</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card wide">
+        <h2>4. 虚拟机列表</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>资源组</th>
+                <th>地区</th>
+                <th>规格</th>
+                <th>状态</th>
+                <th>部署状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="vmTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card wide">
+        <div class="row-head">
+          <h2>5. 审计日志</h2>
+          <button id="loadAuditBtn" type="button">刷新审计</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>用户</th>
+                <th>IP</th>
+                <th>动作</th>
+                <th>结果</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody id="auditTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <aside id="logPanel" class="log"></aside>
+    <script src="/app.js"></script>
+  </body>
+</html>
