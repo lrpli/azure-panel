@@ -1,36 +1,56 @@
 const els = {
+  authBlock: document.getElementById('auth-block'),
   loginForm: document.getElementById('loginForm'),
   authStatus: document.getElementById('authStatus'),
+  navAuthStatus: document.getElementById('navAuthStatus'),
   logoutBtn: document.getElementById('logoutBtn'),
-  appMain: document.getElementById('appMain'),
-  configForm: document.getElementById('configForm'),
   refreshAllBtn: document.getElementById('refreshAllBtn'),
+  appMain: document.getElementById('appMain'),
+
+  topSubscriptionChip: document.getElementById('topSubscriptionChip'),
+  topLocationChip: document.getElementById('topLocationChip'),
+  topVmCountChip: document.getElementById('topVmCountChip'),
+
+  configForm: document.getElementById('configForm'),
   subscriptionSelect: document.getElementById('subscriptionSelect'),
   locationSelect: document.getElementById('locationSelect'),
   sizeSelect: document.getElementById('sizeSelect'),
+  createVmSizeSelect: document.getElementById('createVmSizeSelect'),
+  vmSizeManualInput: document.getElementById('vmSizeManualInput'),
   loadLocationsBtn: document.getElementById('loadLocationsBtn'),
   loadSizesBtn: document.getElementById('loadSizesBtn'),
   loadVmsBtn: document.getElementById('loadVmsBtn'),
+
   vmTableBody: document.getElementById('vmTableBody'),
   createVmForm: document.getElementById('createVmForm'),
-  logPanel: document.getElementById('logPanel'),
   imageSelect: document.getElementById('imageSelect'),
   authTypeSelect: document.getElementById('authTypeSelect'),
   networkModeSelect: document.getElementById('networkModeSelect'),
   passwordLabel: document.getElementById('passwordLabel'),
   sshLabel: document.getElementById('sshLabel'),
   nicLabel: document.getElementById('nicLabel'),
+
+  toggleFiltersBtn: document.getElementById('toggleFiltersBtn'),
+  vmFiltersPanel: document.getElementById('vmFiltersPanel'),
+  vmFilterKeyword: document.getElementById('vmFilterKeyword'),
+  vmFilterPower: document.getElementById('vmFilterPower'),
+  vmFilterResourceGroup: document.getElementById('vmFilterResourceGroup'),
+  applyVmFilterBtn: document.getElementById('applyVmFilterBtn'),
+  resetVmFilterBtn: document.getElementById('resetVmFilterBtn'),
+
   loadAuditBtn: document.getElementById('loadAuditBtn'),
   auditTableBody: document.getElementById('auditTableBody'),
   sizeSourceBadge: document.getElementById('sizeSourceBadge'),
-  sizeCountBadge: document.getElementById('sizeCountBadge')
+  sizeCountBadge: document.getElementById('sizeCountBadge'),
+  logPanel: document.getElementById('logPanel')
 };
 
 const state = {
   authenticated: false,
   username: '',
   images: [],
-  vmSizesByLocation: {}
+  vmSizesByLocation: {},
+  allVms: []
 };
 
 boot().catch((err) => log(err.message || String(err), true));
@@ -40,6 +60,7 @@ async function boot() {
   toggleAuthFields();
   toggleNetworkFields();
   updateSizeMeta('-', 0);
+  updateTopChips('-', '-', 0, 0);
 
   await checkAuthState();
   if (state.authenticated) {
@@ -61,6 +82,7 @@ function bindEvents() {
         body: payload,
         allowUnauthorized: true
       });
+
       setAuthenticated(true, result.username || payload.username);
       log(`登录成功: ${result.username || payload.username}`);
       await initializeAppAfterLogin();
@@ -80,6 +102,20 @@ function bindEvents() {
     });
   });
 
+  els.refreshAllBtn.addEventListener('click', async (e) => {
+    if (!ensureAuthenticated()) {
+      return;
+    }
+
+    await withBusy(e.currentTarget, async () => {
+      await refreshSubscriptions();
+      await loadLocations();
+      await loadSizes();
+      await loadVms();
+      await loadAudit();
+    });
+  });
+
   els.configForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!ensureAuthenticated()) {
@@ -96,20 +132,7 @@ function bindEvents() {
       });
       state.vmSizesByLocation = {};
       log('Azure 凭据已保存。');
-      await refreshSubscriptions();
-      await loadLocations();
-      await loadSizes();
-      await loadVms();
-      await loadAudit();
-    });
-  });
 
-  els.refreshAllBtn.addEventListener('click', async (e) => {
-    if (!ensureAuthenticated()) {
-      return;
-    }
-
-    await withBusy(e.currentTarget, async () => {
       await refreshSubscriptions();
       await loadLocations();
       await loadSizes();
@@ -150,7 +173,9 @@ function bindEvents() {
     if (!ensureAuthenticated()) {
       return;
     }
+
     state.vmSizesByLocation = {};
+    updateTopChips(currentSubscription(), els.locationSelect.value || '-', state.allVms.length, state.allVms.length);
     await loadLocations();
     await loadSizes();
     await loadVms();
@@ -160,6 +185,8 @@ function bindEvents() {
     if (!ensureAuthenticated()) {
       return;
     }
+
+    updateTopChips(currentSubscription(), els.locationSelect.value || '-', state.allVms.length, state.allVms.length);
     await loadSizes();
   });
 
@@ -177,7 +204,25 @@ function bindEvents() {
 
     payload.subscriptionId = currentSubscription();
     payload.location = els.locationSelect.value;
-    payload.vmSize = els.sizeSelect.value;
+    payload.vmSize = String(payload.vmSizeManual || '').trim() ||
+      els.createVmSizeSelect.value ||
+      els.sizeSelect.value;
+
+    delete payload.vmSizeManual;
+    delete payload.vmSizeSelect;
+
+    if (!payload.subscriptionId) {
+      log('请先选择订阅。', true);
+      return;
+    }
+    if (!payload.location) {
+      log('请先选择地区。', true);
+      return;
+    }
+    if (!payload.vmSize) {
+      log('请先选择创建规格，或手动输入规格（例如 Standard_B1s）。', true);
+      return;
+    }
 
     await withBusy(e.submitter, async () => {
       const result = await api('/api/vm/create', {
@@ -189,6 +234,30 @@ function bindEvents() {
       await loadAudit();
     });
   });
+
+  els.toggleFiltersBtn.addEventListener('click', () => {
+    const hidden = els.vmFiltersPanel.classList.toggle('collapsed');
+    els.toggleFiltersBtn.textContent = hidden ? '筛选面板' : '收起筛选';
+  });
+
+  els.applyVmFilterBtn.addEventListener('click', applyVmFiltersAndRender);
+
+  els.resetVmFilterBtn.addEventListener('click', () => {
+    els.vmFilterKeyword.value = '';
+    els.vmFilterPower.value = '';
+    els.vmFilterResourceGroup.value = '';
+    applyVmFiltersAndRender();
+  });
+
+  els.vmFilterKeyword.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      applyVmFiltersAndRender();
+    }
+  });
+
+  els.vmFilterPower.addEventListener('change', applyVmFiltersAndRender);
+  els.vmFilterResourceGroup.addEventListener('change', applyVmFiltersAndRender);
 }
 
 async function checkAuthState() {
@@ -211,8 +280,8 @@ async function initializeAppAfterLogin() {
     await loadSizes();
     await loadVms();
   } else {
-    log('请先填写 Tenant ID / Client ID / Client Secret。');
     clearVmTable('请先配置 Azure 凭据。');
+    log('请先填写 Tenant ID / Client ID / Client Secret。', true);
   }
 
   await loadAudit();
@@ -230,19 +299,37 @@ function setAuthenticated(authenticated, username) {
   state.authenticated = Boolean(authenticated);
   state.username = authenticated ? String(username || '') : '';
 
+  if (els.authBlock) {
+    els.authBlock.classList.toggle('hidden', state.authenticated);
+  }
+
   els.appMain.classList.toggle('hidden', !state.authenticated);
   els.logoutBtn.disabled = !state.authenticated;
   els.refreshAllBtn.disabled = !state.authenticated;
-  els.authStatus.textContent = state.authenticated ? `已登录: ${state.username}` : '未登录';
+
+  const statusText = state.authenticated ? `已登录: ${state.username}` : '未登录';
+  els.authStatus.textContent = statusText;
+  if (els.navAuthStatus) {
+    els.navAuthStatus.textContent = statusText;
+  }
 }
 
 function clearAppData() {
   fillSelect(els.subscriptionSelect, []);
   fillSelect(els.locationSelect, []);
   fillSelect(els.sizeSelect, []);
+  fillSelect(els.createVmSizeSelect, []);
   fillSelect(els.imageSelect, []);
+
   state.vmSizesByLocation = {};
+  state.allVms = [];
+
+  els.vmFilterKeyword.value = '';
+  els.vmFilterPower.value = '';
+  els.vmFilterResourceGroup.innerHTML = '<option value="">全部资源组</option>';
+
   updateSizeMeta('-', 0);
+  updateTopChips('-', '-', 0, 0);
   clearVmTable('请先登录。');
   clearAuditTable('请先登录。');
 }
@@ -260,17 +347,20 @@ function toggleNetworkFields() {
 
 async function refreshSubscriptions() {
   const data = await api('/api/subscriptions');
+  const subscriptions = data.subscriptions || [];
+
   fillSelect(
     els.subscriptionSelect,
-    (data.subscriptions || []).map((s) => ({ value: s.id, label: `${s.displayName} (${s.id})` }))
+    subscriptions.map((s) => ({ value: s.id, label: `${s.displayName} (${s.id})` }))
   );
 
-  if (!(data.subscriptions || []).length) {
+  if (!subscriptions.length) {
     log('未找到可用订阅，请检查服务主体权限。', true);
     return;
   }
 
-  log(`订阅加载完成，共 ${(data.subscriptions || []).length} 个。`);
+  updateTopChips(currentSubscription(), els.locationSelect.value || '-', state.allVms.length, state.allVms.length);
+  log(`订阅加载完成，共 ${subscriptions.length} 个。`);
 }
 
 async function loadLocations() {
@@ -280,12 +370,15 @@ async function loadLocations() {
   }
 
   const data = await api(`/api/locations?subscriptionId=${encodeURIComponent(subscriptionId)}`);
+  const locations = data.locations || [];
+
   fillSelect(
     els.locationSelect,
-    (data.locations || []).map((x) => ({ value: x, label: x }))
+    locations.map((x) => ({ value: x, label: x }))
   );
 
-  log(`地区加载完成，共 ${(data.locations || []).length} 个。`);
+  updateTopChips(subscriptionId, els.locationSelect.value || '-', state.allVms.length, state.allVms.length);
+  log(`地区加载完成，共 ${locations.length} 个。`);
 }
 
 async function loadSizes() {
@@ -305,13 +398,23 @@ async function loadSizes() {
     }))
   );
 
+  fillSelect(
+    els.createVmSizeSelect,
+    result.sizes.map((s) => ({
+      value: s.name,
+      label: formatSizeLabel(s)
+    }))
+  );
+
   updateSizeMeta(result.source, result.sizes.length);
+  updateTopChips(subscriptionId, location, state.allVms.length, state.allVms.length);
   log(`规格加载完成，共 ${result.sizes.length} 个（来源: ${result.source}）。`);
 }
 
 async function loadImages() {
   const data = await api('/api/images');
   state.images = data.images || [];
+
   fillSelect(
     els.imageSelect,
     state.images.map((img) => ({ value: img.id, label: img.label }))
@@ -322,19 +425,83 @@ async function loadVms() {
   const subscriptionId = currentSubscription();
   if (!subscriptionId) {
     clearVmTable('请先选择订阅。');
+    updateTopChips('-', els.locationSelect.value || '-', 0, 0);
     return;
   }
 
   const data = await api(`/api/vms?subscriptionId=${encodeURIComponent(subscriptionId)}`);
   const rows = data.vms || [];
+  state.allVms = rows;
+
+  populateResourceGroupFilter(rows);
+  await prefetchSizesForVmRows(subscriptionId, rows);
+  applyVmFiltersAndRender();
+
+  log(`虚拟机加载完成，共 ${rows.length} 台。`);
+}
+
+function applyVmFiltersAndRender() {
+  const keyword = String(els.vmFilterKeyword.value || '').trim().toLowerCase();
+  const power = String(els.vmFilterPower.value || '').trim().toLowerCase();
+  const rg = String(els.vmFilterResourceGroup.value || '').trim();
+
+  const filtered = state.allVms.filter((vm) => {
+    const name = String(vm.name || '').toLowerCase();
+    const powerState = String(vm.powerState || '').toLowerCase();
+    const resourceGroup = String(vm.resourceGroup || '');
+
+    if (keyword && name.indexOf(keyword) < 0) {
+      return false;
+    }
+    if (power && powerState.indexOf(power) < 0) {
+      return false;
+    }
+    if (rg && resourceGroup !== rg) {
+      return false;
+    }
+
+    return true;
+  });
+
+  renderVmRows(filtered);
+  updateTopChips(
+    currentSubscription(),
+    els.locationSelect.value || '-',
+    filtered.length,
+    state.allVms.length
+  );
+}
+
+async function prefetchSizesForVmRows(subscriptionId, rows) {
+  const unique = {};
+
+  for (const vm of rows) {
+    const key = normalizeLocationKey(vm.location);
+    if (!key || unique[key]) {
+      continue;
+    }
+    unique[key] = vm.location;
+  }
+
+  const locations = Object.keys(unique).map((key) => unique[key]);
+  for (const location of locations) {
+    try {
+      await getVmSizeOptionsForLocation(subscriptionId, location);
+    } catch (err) {
+      log(`地区 ${location} 规格预加载失败: ${err.message || String(err)}`, true);
+    }
+  }
+}
+
+function renderVmRows(rows) {
   els.vmTableBody.innerHTML = '';
 
   if (!rows.length) {
-    clearVmTable('该订阅暂无虚拟机。');
+    clearVmTable('没有匹配的虚拟机。');
     return;
   }
 
-  await prefetchSizesForVmRows(subscriptionId, rows);
+  const subscriptionId = currentSubscription();
 
   for (const vm of rows) {
     const tr = document.createElement('tr');
@@ -342,8 +509,8 @@ async function loadVms() {
     appendCell(tr, vm.resourceGroup || '-');
     appendCell(tr, vm.location || '-');
     appendCell(tr, vm.vmSize || '-');
-    appendCell(tr, vm.powerState || '-');
-    appendCell(tr, vm.provisioningState || '-');
+    appendStatusCell(tr, vm.powerState || '-', 'power');
+    appendStatusCell(tr, vm.provisioningState || '-', 'provision');
 
     const targetSizeTd = document.createElement('td');
     const sizeSelect = buildVmTargetSizeSelect(vm);
@@ -405,8 +572,8 @@ async function loadVms() {
             body: payload
           });
 
-          const sizeSuffix = payload.vmSize ? ` (${payload.vmSize})` : '';
-          log(`操作成功: ${vm.name} -> ${action}${sizeSuffix}`);
+          const suffix = payload.vmSize ? ` (${payload.vmSize})` : '';
+          log(`操作成功: ${vm.name} -> ${action}${suffix}`);
           await loadVms();
           await loadAudit();
         });
@@ -419,29 +586,33 @@ async function loadVms() {
     tr.appendChild(actionTd);
     els.vmTableBody.appendChild(tr);
   }
-
-  log(`虚拟机加载完成，共 ${rows.length} 台。`);
 }
 
-async function prefetchSizesForVmRows(subscriptionId, rows) {
+function populateResourceGroupFilter(rows) {
+  const current = String(els.vmFilterResourceGroup.value || '').trim();
   const seen = {};
-  const locations = [];
+  const list = [];
 
   for (const vm of rows) {
-    const key = normalizeLocationKey(vm.location);
-    if (!key || seen[key]) {
+    const rg = String(vm.resourceGroup || '').trim();
+    if (!rg || seen[rg]) {
       continue;
     }
-    seen[key] = true;
-    locations.push(vm.location);
+    seen[rg] = true;
+    list.push(rg);
   }
 
-  for (const location of locations) {
-    try {
-      await getVmSizeOptionsForLocation(subscriptionId, location);
-    } catch (err) {
-      log(`地区 ${location} 规格预加载失败: ${err.message || String(err)}`, true);
+  list.sort();
+
+  els.vmFilterResourceGroup.innerHTML = '<option value="">全部资源组</option>';
+  for (const rg of list) {
+    const opt = document.createElement('option');
+    opt.value = rg;
+    opt.textContent = rg;
+    if (rg === current) {
+      opt.selected = true;
     }
+    els.vmFilterResourceGroup.appendChild(opt);
   }
 }
 
@@ -449,9 +620,10 @@ function buildVmTargetSizeSelect(vm) {
   const select = document.createElement('select');
   select.className = 'inline-size-select';
 
-  const locationKey = normalizeLocationKey(vm.location);
-  const cached = state.vmSizesByLocation[locationKey] || [];
+  const key = normalizeLocationKey(vm.location);
+  const cached = state.vmSizesByLocation[key] || [];
   const currentSize = String(vm.vmSize || '').trim();
+
   const options = [];
   const seen = {};
 
@@ -475,21 +647,21 @@ function buildVmTargetSizeSelect(vm) {
   }
 
   if (!options.length) {
-    const emptyOpt = document.createElement('option');
-    emptyOpt.value = '';
-    emptyOpt.textContent = '无可用规格';
-    select.appendChild(emptyOpt);
+    const empty = document.createElement('option');
+    empty.value = '';
+    empty.textContent = '无可用规格';
+    select.appendChild(empty);
     return select;
   }
 
-  for (const opt of options) {
-    const optionEl = document.createElement('option');
-    optionEl.value = opt.name;
-    optionEl.textContent = opt.synthetic ? `${opt.name} (当前)` : formatSizeLabel(opt);
-    if (opt.name === currentSize) {
-      optionEl.selected = true;
+  for (const item of options) {
+    const opt = document.createElement('option');
+    opt.value = item.name;
+    opt.textContent = item.synthetic ? `${item.name} (当前)` : formatSizeLabel(item);
+    if (item.name === currentSize) {
+      opt.selected = true;
     }
-    select.appendChild(optionEl);
+    select.appendChild(opt);
   }
 
   return select;
@@ -518,6 +690,22 @@ async function getVmSizeOptionsForLocation(subscriptionId, location) {
   };
 }
 
+function updateTopChips(subscriptionId, location, filteredCount, totalCount) {
+  const sub = subscriptionId && subscriptionId !== '-' ? subscriptionId : '-';
+  const loc = location && location !== '-' ? location : '-';
+  const filtered = Number(filteredCount || 0);
+  const total = Number(totalCount || 0);
+
+  els.topSubscriptionChip.textContent = `订阅: ${sub === '-' ? '-' : shortText(sub, 22)}`;
+  els.topLocationChip.textContent = `地区: ${loc}`;
+  els.topVmCountChip.textContent = total > 0 ? `VM: ${filtered}/${total}` : 'VM: 0';
+}
+
+function updateSizeMeta(source, count) {
+  els.sizeSourceBadge.textContent = `规格来源: ${source || '-'}`;
+  els.sizeCountBadge.textContent = `数量: ${count || 0}`;
+}
+
 function normalizeLocationKey(location) {
   return String(location || '').trim().toLowerCase();
 }
@@ -535,18 +723,7 @@ function formatSizeLabel(size) {
   const memoryGb = Number(size.memoryInMB || 0) / 1024;
   const disk = Number(size.maxDataDiskCount || 0);
 
-  const left = size.name || '-';
-  const right = `${cores || 0} vCPU | ${memoryGb ? memoryGb.toFixed(1) : '0.0'} GB | ${disk || 0} Disk`;
-  return `${left} | ${right}`;
-}
-
-function updateSizeMeta(source, count) {
-  if (els.sizeSourceBadge) {
-    els.sizeSourceBadge.textContent = `规格来源: ${source || '-'}`;
-  }
-  if (els.sizeCountBadge) {
-    els.sizeCountBadge.textContent = `数量: ${count || 0}`;
-  }
+  return `${size.name || '-'} | ${cores || 0} vCPU | ${memoryGb ? memoryGb.toFixed(1) : '0.0'} GB | ${disk || 0} Disk`;
 }
 
 function appendCell(tr, value) {
@@ -555,11 +732,44 @@ function appendCell(tr, value) {
   tr.appendChild(td);
 }
 
+function appendStatusCell(tr, value, kind) {
+  const td = document.createElement('td');
+  const span = document.createElement('span');
+  span.className = `pill ${pillClass(value, kind)}`;
+  span.textContent = String(value == null ? '-' : value);
+  td.appendChild(span);
+  tr.appendChild(td);
+}
+
+function pillClass(value, kind) {
+  const v = String(value || '').toLowerCase();
+
+  if (kind === 'power') {
+    if (v.indexOf('running') >= 0 || v.indexOf('start') >= 0) {
+      return 'pill-ok';
+    }
+    if (v.indexOf('deallocated') >= 0 || v.indexOf('stopped') >= 0 || v.indexOf('off') >= 0) {
+      return 'pill-warn';
+    }
+  }
+
+  if (kind === 'provision') {
+    if (v.indexOf('succeeded') >= 0) {
+      return 'pill-ok';
+    }
+    if (v.indexOf('failed') >= 0 || v.indexOf('error') >= 0) {
+      return 'pill-danger';
+    }
+  }
+
+  return 'pill-muted';
+}
+
 async function loadAudit() {
   const data = await api('/api/audit?limit=120');
   const rows = data.entries || [];
-  els.auditTableBody.innerHTML = '';
 
+  els.auditTableBody.innerHTML = '';
   if (!rows.length) {
     clearAuditTable('暂无审计记录。');
     return;
@@ -597,6 +807,7 @@ function formatDetails(details) {
   if (!details) {
     return '-';
   }
+
   const raw = JSON.stringify(details);
   return raw.length > 180 ? `${raw.slice(0, 180)}...` : raw;
 }
@@ -605,11 +816,21 @@ function formatDate(value) {
   if (!value) {
     return '-';
   }
+
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) {
     return value;
   }
+
   return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
+function shortText(text, maxLen) {
+  const s = String(text || '');
+  if (s.length <= maxLen) {
+    return s;
+  }
+  return `${s.slice(0, maxLen)}...`;
 }
 
 function currentSubscription() {
@@ -636,11 +857,13 @@ async function api(url, options = {}) {
     log(message, true);
     throw new Error(message);
   }
+
   return data;
 }
 
 function fillSelect(select, options) {
   select.innerHTML = '';
+
   if (!options.length) {
     const empty = document.createElement('option');
     empty.value = '';
@@ -669,16 +892,18 @@ function escapeHtml(input) {
 function log(text, isError = false) {
   const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const line = `[${stamp}] ${isError ? 'ERROR' : 'INFO '} ${text}`;
-  els.logPanel.textContent = `${line}\n${els.logPanel.textContent}`.slice(0, 16000);
+  els.logPanel.textContent = `${line}\n${els.logPanel.textContent}`.slice(0, 18000);
 }
 
 async function withBusy(buttonEl, fn) {
   if (!buttonEl) {
     return fn();
   }
+
   const original = buttonEl.textContent;
   buttonEl.disabled = true;
   buttonEl.textContent = '处理中...';
+
   try {
     return await fn();
   } finally {

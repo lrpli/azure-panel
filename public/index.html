@@ -7,199 +7,283 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <header class="hero">
-      <div class="hero-copy">
-        <p class="eyebrow">Control Plane</p>
-        <h1>Azure VM 作战控制台</h1>
-        <p>创建、改规格、开关机与审计，全流程可视化。</p>
-      </div>
-      <div class="hero-actions">
-        <span id="authStatus">未登录</span>
-        <button id="logoutBtn" type="button">退出登录</button>
-        <button id="refreshAllBtn" class="primary">刷新数据</button>
-      </div>
-    </header>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <p class="brand-eyebrow">Operations</p>
+          <h1>Azure Panel</h1>
+          <p>VM 生命周期控制台</p>
+        </div>
 
-    <section class="card auth-card">
-      <h2>登录</h2>
-      <form id="loginForm" class="form auth-form">
-        <label>
-          用户名
-          <input name="username" required placeholder="admin" />
-        </label>
-        <label>
-          密码
-          <input name="password" type="password" required placeholder="输入管理密码" />
-        </label>
-        <button class="primary" type="submit">登录</button>
-      </form>
-    </section>
+        <nav class="nav">
+          <a href="#section-credentials">Azure 凭据</a>
+          <a href="#section-resources">订阅与资源</a>
+          <a href="#section-create">创建虚拟机</a>
+          <a href="#section-vms">虚拟机列表</a>
+          <a href="#section-audit">审计日志</a>
+        </nav>
 
-    <main id="appMain" class="grid hidden">
-      <section class="card">
-        <h2>1. Azure 凭据</h2>
-        <form id="configForm" class="form">
-          <label>
-            Tenant ID
-            <input name="tenantId" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
-          </label>
-          <label>
-            Client ID
-            <input name="clientId" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
-          </label>
-          <label>
-            Client Secret
-            <input name="clientSecret" type="password" required placeholder="应用密钥" />
-          </label>
-          <button class="primary" type="submit">保存并连接</button>
-        </form>
-        <p class="hint">只保存在当前服务进程内存中，不会写入文件。</p>
-      </section>
+        <div class="sidebar-meta">
+          <p class="meta-label">会话状态</p>
+          <p id="navAuthStatus" class="meta-value">未登录</p>
+          <p class="meta-tip">建议在受控网络中访问</p>
+        </div>
+      </aside>
 
-      <section class="card">
-        <h2>2. 订阅与资源</h2>
-        <div class="form">
-          <label>
-            订阅
-            <select id="subscriptionSelect"></select>
-          </label>
-          <label>
-            地区
-            <select id="locationSelect"></select>
-          </label>
-          <label>
-            机型规格
-            <select id="sizeSelect"></select>
-          </label>
-          <p class="hint status-hint">
-            <span id="sizeSourceBadge">规格来源: -</span>
-            <span id="sizeCountBadge">数量: 0</span>
-          </p>
-          <div class="row-actions">
-            <button id="loadLocationsBtn" type="button">加载地区</button>
-            <button id="loadSizesBtn" type="button">加载规格</button>
-            <button id="loadVmsBtn" class="primary" type="button">加载虚拟机</button>
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-copy">
+            <p class="eyebrow">Cloud Control</p>
+            <h2>Azure VM 作战控制台</h2>
+            <p>像 SaaS 控制面板一样管理虚拟机，减少重复命令操作。</p>
           </div>
-        </div>
-      </section>
 
-      <section class="card wide">
-        <h2>3. 创建新虚拟机</h2>
-        <form id="createVmForm" class="form two-cols">
-          <label>
-            VM 名称
-            <input name="name" required placeholder="demo-vm" pattern="[A-Za-z0-9-]{1,64}" />
-          </label>
-          <label>
-            资源组
-            <input name="resourceGroup" required placeholder="rg-demo" />
-          </label>
-          <label>
-            管理员用户名
-            <input name="adminUsername" required placeholder="azureuser" />
-          </label>
-          <label>
-            镜像
-            <select name="imageId" id="imageSelect"></select>
-          </label>
-
-          <label>
-            认证方式
-            <select name="authType" id="authTypeSelect">
-              <option value="password">密码</option>
-              <option value="ssh">SSH 公钥</option>
-            </select>
-          </label>
-
-          <label id="passwordLabel">
-            管理员密码
-            <input name="adminPassword" type="password" placeholder="至少 12 位" />
-          </label>
-
-          <label id="sshLabel" class="hidden full">
-            SSH 公钥
-            <textarea name="sshPublicKey" rows="3" placeholder="ssh-rsa AAAA..."></textarea>
-          </label>
-
-          <label>
-            网络模式
-            <select name="networkMode" id="networkModeSelect">
-              <option value="auto">自动创建网络资源</option>
-              <option value="existing-nic">使用现有 NIC</option>
-            </select>
-          </label>
-
-          <label id="nicLabel" class="hidden full">
-            现有 NIC 资源 ID
-            <input name="existingNicId" placeholder="/subscriptions/.../networkInterfaces/xxx" />
-          </label>
-
-          <label>
-            VNet 名称（可选）
-            <input name="vnetName" placeholder="vnet-demo" />
-          </label>
-          <label>
-            Subnet 名称（可选）
-            <input name="subnetName" placeholder="default" />
-          </label>
-          <label>
-            地址段（可选）
-            <input name="addressPrefix" placeholder="10.20.0.0/16" />
-          </label>
-          <label>
-            子网段（可选）
-            <input name="subnetPrefix" placeholder="10.20.1.0/24" />
-          </label>
-
-          <div class="full">
-            <button class="primary" type="submit">创建虚拟机</button>
+          <div class="topbar-right">
+            <div class="status-strip">
+              <span id="authStatus">未登录</span>
+              <span id="topSubscriptionChip">订阅: -</span>
+              <span id="topLocationChip">地区: -</span>
+              <span id="topVmCountChip">VM: 0</span>
+            </div>
+            <div class="topbar-actions">
+              <button id="refreshAllBtn" class="primary" type="button">刷新数据</button>
+              <button id="logoutBtn" type="button">退出登录</button>
+            </div>
           </div>
-        </form>
-      </section>
+        </header>
 
-      <section class="card wide">
-        <h2>4. 虚拟机列表</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>资源组</th>
-                <th>地区</th>
-                <th>规格</th>
-                <th>状态</th>
-                <th>部署状态</th>
-                <th>目标规格</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody id="vmTableBody"></tbody>
-          </table>
-        </div>
-      </section>
+        <section class="card auth-card" id="auth-block">
+          <h3>登录</h3>
+          <p class="card-desc">先登录后才能调用 Azure 管理接口。</p>
+          <form id="loginForm" class="form auth-form">
+            <label>
+              用户名
+              <input name="username" required placeholder="admin" />
+            </label>
+            <label>
+              密码
+              <input name="password" type="password" required placeholder="输入管理密码" />
+            </label>
+            <button class="primary" type="submit">登录</button>
+          </form>
+        </section>
 
-      <section class="card wide">
-        <div class="row-head">
-          <h2>5. 审计日志</h2>
-          <button id="loadAuditBtn" type="button">刷新审计</button>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>用户</th>
-                <th>IP</th>
-                <th>动作</th>
-                <th>结果</th>
-                <th>详情</th>
-              </tr>
-            </thead>
-            <tbody id="auditTableBody"></tbody>
-          </table>
-        </div>
-      </section>
-    </main>
+        <main id="appMain" class="content hidden">
+          <section class="card" id="section-credentials">
+            <h3>1. Azure 凭据</h3>
+            <p class="card-desc">凭据仅存于当前进程内存，不写入数据库。</p>
+            <form id="configForm" class="form two-cols">
+              <label>
+                Tenant ID
+                <input name="tenantId" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+              </label>
+              <label>
+                Client ID
+                <input name="clientId" required placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" />
+              </label>
+              <label class="full">
+                Client Secret
+                <input name="clientSecret" type="password" required placeholder="应用密钥" />
+              </label>
+              <div class="full row-actions">
+                <button class="primary" type="submit">保存并连接</button>
+              </div>
+            </form>
+            <p class="hint">建议使用最小权限 Service Principal。</p>
+          </section>
+
+          <section class="card" id="section-resources">
+            <h3>2. 订阅与资源</h3>
+            <p class="card-desc">先加载地区和规格，再进行创建或改规格。</p>
+            <div class="form two-cols">
+              <label>
+                订阅
+                <select id="subscriptionSelect"></select>
+              </label>
+              <label>
+                地区
+                <select id="locationSelect"></select>
+              </label>
+              <label class="full">
+                机型规格（全局）
+                <select id="sizeSelect"></select>
+              </label>
+              <p class="hint status-hint full">
+                <span id="sizeSourceBadge">规格来源: -</span>
+                <span id="sizeCountBadge">数量: 0</span>
+              </p>
+              <div class="row-actions full">
+                <button id="loadLocationsBtn" type="button">加载地区</button>
+                <button id="loadSizesBtn" type="button">加载规格</button>
+                <button id="loadVmsBtn" class="primary" type="button">加载虚拟机</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="card wide" id="section-create">
+            <h3>3. 创建新虚拟机</h3>
+            <p class="card-desc">支持密码/SSH、公网自动网络和自定义规格。</p>
+            <form id="createVmForm" class="form three-cols">
+              <label>
+                VM 名称
+                <input name="name" required placeholder="demo-vm" pattern="[A-Za-z0-9-]{1,64}" />
+              </label>
+              <label>
+                资源组
+                <input name="resourceGroup" required placeholder="rg-demo" />
+              </label>
+              <label>
+                管理员用户名
+                <input name="adminUsername" required placeholder="azureuser" />
+              </label>
+
+              <label>
+                创建规格
+                <select name="vmSizeSelect" id="createVmSizeSelect"></select>
+              </label>
+              <label>
+                手动规格（可选）
+                <input name="vmSizeManual" id="vmSizeManualInput" placeholder="例如 Standard_B1s" />
+              </label>
+              <label>
+                镜像
+                <select name="imageId" id="imageSelect"></select>
+              </label>
+
+              <label>
+                认证方式
+                <select name="authType" id="authTypeSelect">
+                  <option value="password">密码</option>
+                  <option value="ssh">SSH 公钥</option>
+                </select>
+              </label>
+              <label id="passwordLabel">
+                管理员密码
+                <input name="adminPassword" type="password" placeholder="至少 12 位" />
+              </label>
+              <label id="sshLabel" class="hidden">
+                SSH 公钥
+                <textarea name="sshPublicKey" rows="2" placeholder="ssh-rsa AAAA..."></textarea>
+              </label>
+
+              <label>
+                网络模式
+                <select name="networkMode" id="networkModeSelect">
+                  <option value="auto">自动创建网络资源</option>
+                  <option value="existing-nic">使用现有 NIC</option>
+                </select>
+              </label>
+              <label id="nicLabel" class="hidden span-2">
+                现有 NIC 资源 ID
+                <input name="existingNicId" placeholder="/subscriptions/.../networkInterfaces/xxx" />
+              </label>
+
+              <label>
+                VNet 名称（可选）
+                <input name="vnetName" placeholder="vnet-demo" />
+              </label>
+              <label>
+                Subnet 名称（可选）
+                <input name="subnetName" placeholder="default" />
+              </label>
+              <label>
+                地址段（可选）
+                <input name="addressPrefix" placeholder="10.20.0.0/16" />
+              </label>
+              <label>
+                子网段（可选）
+                <input name="subnetPrefix" placeholder="10.20.1.0/24" />
+              </label>
+
+              <div class="row-actions full">
+                <button class="primary" type="submit">创建虚拟机</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="card wide" id="section-vms">
+            <div class="row-head">
+              <div>
+                <h3>4. 虚拟机列表</h3>
+                <p class="card-desc">支持行内改规格、按目标规格开机、重启与删除。</p>
+              </div>
+              <button id="toggleFiltersBtn" type="button">筛选面板</button>
+            </div>
+
+            <div id="vmFiltersPanel" class="filters-panel collapsed">
+              <div class="form filters-grid">
+                <label>
+                  关键词
+                  <input id="vmFilterKeyword" placeholder="按 VM 名称搜索" />
+                </label>
+                <label>
+                  电源状态
+                  <select id="vmFilterPower">
+                    <option value="">全部状态</option>
+                    <option value="running">运行中</option>
+                    <option value="stopped">已停止</option>
+                    <option value="deallocated">已释放</option>
+                  </select>
+                </label>
+                <label>
+                  资源组
+                  <select id="vmFilterResourceGroup">
+                    <option value="">全部资源组</option>
+                  </select>
+                </label>
+                <div class="row-actions">
+                  <button id="applyVmFilterBtn" class="primary" type="button">应用筛选</button>
+                  <button id="resetVmFilterBtn" type="button">重置筛选</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>资源组</th>
+                    <th>地区</th>
+                    <th>规格</th>
+                    <th>状态</th>
+                    <th>部署状态</th>
+                    <th>目标规格</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="vmTableBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card wide" id="section-audit">
+            <div class="row-head">
+              <div>
+                <h3>5. 审计日志</h3>
+                <p class="card-desc">记录登录、配置修改与 VM 动作，便于追溯。</p>
+              </div>
+              <button id="loadAuditBtn" type="button">刷新审计</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>用户</th>
+                    <th>IP</th>
+                    <th>动作</th>
+                    <th>结果</th>
+                    <th>详情</th>
+                  </tr>
+                </thead>
+                <tbody id="auditTableBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
 
     <aside id="logPanel" class="log"></aside>
     <script src="/app.js"></script>
