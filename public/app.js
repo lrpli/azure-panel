@@ -1,10 +1,13 @@
 const els = {
-  authBlock: document.getElementById('auth-block'),
+  loginView: document.getElementById('loginView'),
+  appShell: document.getElementById('appShell'),
   loginForm: document.getElementById('loginForm'),
   authStatus: document.getElementById('authStatus'),
   navAuthStatus: document.getElementById('navAuthStatus'),
   logoutBtn: document.getElementById('logoutBtn'),
   refreshAllBtn: document.getElementById('refreshAllBtn'),
+  densityComfortBtn: document.getElementById('densityComfortBtn'),
+  densityCompactBtn: document.getElementById('densityCompactBtn'),
   appMain: document.getElementById('appMain'),
 
   topSubscriptionChip: document.getElementById('topSubscriptionChip'),
@@ -78,7 +81,11 @@ const els = {
   resourceActionHint: document.getElementById('resourceActionHint'),
   createActionHint: document.getElementById('createActionHint'),
   requestFeed: document.getElementById('requestFeed'),
-  eventFeed: document.getElementById('eventFeed')
+  eventFeed: document.getElementById('eventFeed'),
+  sectionPrevBtn: document.getElementById('sectionPrevBtn'),
+  sectionNextBtn: document.getElementById('sectionNextBtn'),
+  sectionPageInfo: document.getElementById('sectionPageInfo'),
+  sectionNavLinks: Array.from(document.querySelectorAll('.nav a[href^="#section-"]'))
 };
 
 const state = {
@@ -106,11 +113,17 @@ const state = {
   auditPage: 1,
   auditPageSize: 20,
   requestFeed: [],
-  eventFeed: []
+  eventFeed: [],
+  currentSectionId: '',
+  densityMode: 'comfortable',
+  sectionToolbars: {}
 };
 
 const FEED_LIMIT = 80;
 const SIZE_PREFETCH_CONCURRENCY = 3;
+const DENSITY_STORAGE_KEY = 'azurePanel:densityMode';
+const SECTION_TOOL_TARGET_SELECTOR = 'tbody tr, form label, .check-item, .feed-item, .hint, .card-desc';
+const SECTION_ORDER = buildSectionOrder();
 
 boot().catch((err) => log(err.message || String(err), true));
 
@@ -130,6 +143,9 @@ async function boot() {
   renderTelegramStatusHint();
   renderAuditRows();
   updateActionAvailability();
+  setupDensityToggle();
+  setupSectionPager();
+  setupSectionToolbars();
 
   await checkAuthState();
   if (state.authenticated) {
@@ -521,6 +537,374 @@ function bindEvents() {
   }
 }
 
+function buildSectionOrder() {
+  const out = [];
+  const seen = {};
+
+  for (const link of els.sectionNavLinks || []) {
+    const href = String(link && link.getAttribute('href') ? link.getAttribute('href') : '');
+    const id = href.startsWith('#') ? href.slice(1) : '';
+    if (!id || seen[id]) {
+      continue;
+    }
+
+    const sectionEl = document.getElementById(id);
+    if (!sectionEl) {
+      continue;
+    }
+
+    seen[id] = true;
+    out.push({
+      id,
+      label: String(link.textContent || id).trim() || id,
+      linkEl: link,
+      sectionEl
+    });
+  }
+
+  return out;
+}
+
+function setupDensityToggle() {
+  const saved = String(window.localStorage.getItem(DENSITY_STORAGE_KEY) || '').trim();
+  const initialMode = saved === 'compact' ? 'compact' : 'comfortable';
+  setDensityMode(initialMode, { persist: false });
+
+  if (els.densityComfortBtn) {
+    els.densityComfortBtn.addEventListener('click', () => {
+      setDensityMode('comfortable');
+    });
+  }
+  if (els.densityCompactBtn) {
+    els.densityCompactBtn.addEventListener('click', () => {
+      setDensityMode('compact');
+    });
+  }
+}
+
+function setDensityMode(mode, options = {}) {
+  const nextMode = mode === 'compact' ? 'compact' : 'comfortable';
+  state.densityMode = nextMode;
+  document.body.setAttribute('data-density', nextMode);
+
+  if (els.densityComfortBtn) {
+    els.densityComfortBtn.classList.toggle('active', nextMode === 'comfortable');
+  }
+  if (els.densityCompactBtn) {
+    els.densityCompactBtn.classList.toggle('active', nextMode === 'compact');
+  }
+
+  if (options.persist === false) {
+    return;
+  }
+  window.localStorage.setItem(DENSITY_STORAGE_KEY, nextMode);
+}
+
+function setupSectionPager() {
+  if (!SECTION_ORDER.length) {
+    return;
+  }
+
+  for (const item of SECTION_ORDER) {
+    if (!item.linkEl) {
+      continue;
+    }
+    item.linkEl.addEventListener('click', (e) => {
+      e.preventDefault();
+      activateSection(item.id);
+    });
+  }
+
+  if (els.sectionPrevBtn) {
+    els.sectionPrevBtn.addEventListener('click', () => {
+      const index = getCurrentSectionIndex();
+      const target = Math.max(0, index - 1);
+      activateSection(SECTION_ORDER[target].id);
+    });
+  }
+
+  if (els.sectionNextBtn) {
+    els.sectionNextBtn.addEventListener('click', () => {
+      const index = getCurrentSectionIndex();
+      const target = Math.min(SECTION_ORDER.length - 1, index + 1);
+      activateSection(SECTION_ORDER[target].id);
+    });
+  }
+
+  window.addEventListener('hashchange', () => {
+    const sectionId = getSectionIdFromHash();
+    if (!sectionId) {
+      return;
+    }
+    activateSection(sectionId, { updateHash: false });
+  });
+
+  const initialId = getSectionIdFromHash() || SECTION_ORDER[0].id;
+  activateSection(initialId, { updateHash: false });
+}
+
+function setupSectionToolbars() {
+  if (!SECTION_ORDER.length) {
+    return;
+  }
+
+  for (const item of SECTION_ORDER) {
+    const sectionEl = item.sectionEl;
+    if (!sectionEl) {
+      continue;
+    }
+
+    let toolbarEl = sectionEl.querySelector('[data-section-toolbar]');
+    if (!toolbarEl) {
+      toolbarEl = document.createElement('div');
+      toolbarEl.className = 'section-tools';
+      toolbarEl.setAttribute('data-section-toolbar', item.id);
+      toolbarEl.innerHTML = `
+        <div class="section-tools-left">
+          <input type="search" class="section-tool-search" placeholder="搜索当前页面..." />
+          <select class="section-tool-mode">
+            <option value="all">显示全部</option>
+            <option value="highlight" selected>高亮匹配</option>
+            <option value="match-only">仅显示匹配</option>
+          </select>
+        </div>
+        <div class="section-tools-right">
+          <span class="section-tool-meta">当前: 全部</span>
+          <button type="button" class="section-tool-clear">清除</button>
+          <button type="button" class="section-tool-refresh">刷新本页</button>
+        </div>
+      `;
+
+      const firstChild = sectionEl.firstElementChild;
+      if (!firstChild) {
+        sectionEl.appendChild(toolbarEl);
+      } else if (firstChild.nextSibling) {
+        sectionEl.insertBefore(toolbarEl, firstChild.nextSibling);
+      } else {
+        sectionEl.appendChild(toolbarEl);
+      }
+    }
+
+    const searchInput = toolbarEl.querySelector('.section-tool-search');
+    const modeSelect = toolbarEl.querySelector('.section-tool-mode');
+    const clearBtn = toolbarEl.querySelector('.section-tool-clear');
+    const refreshBtn = toolbarEl.querySelector('.section-tool-refresh');
+    const metaEl = toolbarEl.querySelector('.section-tool-meta');
+
+    state.sectionToolbars[item.id] = {
+      sectionId: item.id,
+      sectionEl,
+      toolbarEl,
+      searchInput,
+      modeSelect,
+      clearBtn,
+      refreshBtn,
+      metaEl,
+      query: searchInput ? String(searchInput.value || '').trim() : '',
+      mode: modeSelect ? String(modeSelect.value || 'highlight') : 'highlight'
+    };
+
+    if (searchInput) {
+      searchInput.addEventListener('input', () => {
+        const tb = state.sectionToolbars[item.id];
+        if (!tb) {
+          return;
+        }
+        tb.query = String(searchInput.value || '').trim();
+        applySectionToolbarFilters(item.id);
+      });
+    }
+
+    if (modeSelect) {
+      modeSelect.addEventListener('change', () => {
+        const tb = state.sectionToolbars[item.id];
+        if (!tb) {
+          return;
+        }
+        tb.mode = String(modeSelect.value || 'highlight');
+        applySectionToolbarFilters(item.id);
+      });
+    }
+
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        const tb = state.sectionToolbars[item.id];
+        if (!tb) {
+          return;
+        }
+        tb.query = '';
+        tb.mode = 'all';
+        if (tb.searchInput) {
+          tb.searchInput.value = '';
+        }
+        if (tb.modeSelect) {
+          tb.modeSelect.value = 'all';
+        }
+        applySectionToolbarFilters(item.id);
+      });
+    }
+
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', async () => {
+        if (!ensureAuthenticated()) {
+          return;
+        }
+        await withBusy(refreshBtn, async () => {
+          await refreshSectionData(item.id);
+        });
+      });
+    }
+
+    applySectionToolbarFilters(item.id);
+  }
+}
+
+async function refreshSectionData(sectionId) {
+  switch (sectionId) {
+    case 'section-credentials':
+      await refreshSubscriptions();
+      await loadLocations();
+      await loadSizes({ force: true });
+      await loadVms();
+      break;
+    case 'section-resources':
+      await refreshSubscriptions();
+      await loadLocations();
+      await loadSizes({ force: true });
+      await loadVms();
+      break;
+    case 'section-create':
+      await loadImages();
+      await loadKeychainEntries();
+      await loadSizes({ force: true });
+      break;
+    case 'section-telegram':
+      await loadTelegramConfig();
+      break;
+    case 'section-vms':
+      await loadVms();
+      break;
+    case 'section-audit':
+      await loadAudit();
+      break;
+    default:
+      await refreshSubscriptions();
+      await loadLocations();
+      await loadSizes({ force: true });
+      await loadVms();
+      await loadAudit();
+      break;
+  }
+}
+
+function applySectionToolbarFilters(sectionId) {
+  const toolbar = state.sectionToolbars[sectionId];
+  if (!toolbar || !toolbar.sectionEl) {
+    return;
+  }
+
+  const mode = toolbar.mode === 'match-only'
+    ? 'match-only'
+    : toolbar.mode === 'all'
+      ? 'all'
+      : 'highlight';
+  const query = String(toolbar.query || '').trim().toLowerCase();
+
+  const targets = Array.from(toolbar.sectionEl.querySelectorAll(SECTION_TOOL_TARGET_SELECTOR))
+    .filter((el) => !el.closest('[data-section-toolbar]'));
+
+  let matched = 0;
+  for (const el of targets) {
+    const text = String(el.textContent || '').toLowerCase();
+    const isMatch = Boolean(query) && text.indexOf(query) >= 0;
+    if (isMatch) {
+      matched += 1;
+    }
+
+    el.classList.toggle('section-tool-match', isMatch);
+    const shouldHide = Boolean(query) && mode === 'match-only' && !isMatch;
+    el.classList.toggle('section-tool-hidden', shouldHide);
+  }
+
+  if (!toolbar.metaEl) {
+    return;
+  }
+
+  if (!query) {
+    toolbar.metaEl.textContent = '当前: 全部';
+    return;
+  }
+
+  if (mode === 'match-only') {
+    toolbar.metaEl.textContent = `仅显示匹配 ${matched} / ${targets.length}`;
+    return;
+  }
+
+  toolbar.metaEl.textContent = `已匹配 ${matched} / ${targets.length}`;
+}
+
+function reapplySectionToolbarFor(sectionId) {
+  if (!sectionId || !state.sectionToolbars[sectionId]) {
+    return;
+  }
+  applySectionToolbarFilters(sectionId);
+}
+
+function getSectionIdFromHash() {
+  const hash = String(window.location.hash || '').replace(/^#/, '').trim();
+  if (!hash) {
+    return '';
+  }
+  return SECTION_ORDER.some((x) => x.id === hash) ? hash : '';
+}
+
+function getCurrentSectionIndex() {
+  const idx = SECTION_ORDER.findIndex((x) => x.id === state.currentSectionId);
+  return idx >= 0 ? idx : 0;
+}
+
+function activateSection(sectionId, options = {}) {
+  const idx = SECTION_ORDER.findIndex((x) => x.id === sectionId);
+  if (idx < 0) {
+    return;
+  }
+
+  state.currentSectionId = sectionId;
+  const current = SECTION_ORDER[idx];
+
+  for (const item of SECTION_ORDER) {
+    item.sectionEl.classList.toggle('section-hidden', item.id !== sectionId);
+    if (item.linkEl) {
+      item.linkEl.classList.toggle('active', item.id === sectionId);
+    }
+  }
+
+  if (els.sectionPageInfo) {
+    els.sectionPageInfo.textContent = `第 ${idx + 1} / ${SECTION_ORDER.length} 页 · ${current.label}`;
+  }
+  if (els.sectionPrevBtn) {
+    els.sectionPrevBtn.disabled = idx <= 0;
+  }
+  if (els.sectionNextBtn) {
+    els.sectionNextBtn.disabled = idx >= SECTION_ORDER.length - 1;
+  }
+  reapplySectionToolbarFor(sectionId);
+
+  if (options.updateHash === false) {
+    return;
+  }
+
+  const targetHash = `#${sectionId}`;
+  if (window.location.hash === targetHash) {
+    return;
+  }
+  if (window.history && typeof window.history.replaceState === 'function') {
+    window.history.replaceState(null, '', targetHash);
+  } else {
+    window.location.hash = targetHash;
+  }
+}
+
 async function checkAuthState() {
   const me = await api('/api/auth/me', { allowUnauthorized: true });
   if (me.authenticated) {
@@ -567,8 +951,17 @@ function setAuthenticated(authenticated, username) {
     state.configured = false;
   }
 
-  if (els.authBlock) {
-    els.authBlock.classList.toggle('hidden', state.authenticated);
+  if (els.loginView) {
+    els.loginView.classList.toggle('hidden', state.authenticated);
+  }
+  if (els.appShell) {
+    els.appShell.classList.toggle('hidden', !state.authenticated);
+  }
+  if (!state.authenticated && els.loginForm) {
+    const usernameInput = els.loginForm.querySelector('input[name="username"]');
+    if (usernameInput && typeof usernameInput.focus === 'function') {
+      usernameInput.focus();
+    }
   }
 
   els.appMain.classList.toggle('hidden', !state.authenticated);
@@ -719,6 +1112,7 @@ function renderSubscriptionRows() {
       totalPages: 1,
       totalCount: 0
     });
+    reapplySectionToolbarFor('section-resources');
     return;
   }
 
@@ -743,6 +1137,7 @@ function renderSubscriptionRows() {
     totalPages: page.totalPages,
     totalCount: page.totalCount
   });
+  reapplySectionToolbarFor('section-resources');
 }
 
 async function loadKeychainEntries() {
@@ -763,6 +1158,7 @@ function renderKeychainRows() {
     const tr = document.createElement('tr');
     tr.innerHTML = '<td colspan="4">暂无 Keychain 条目。</td>';
     els.keychainTableBody.appendChild(tr);
+    reapplySectionToolbarFor('section-create');
     return;
   }
 
@@ -811,6 +1207,7 @@ function renderKeychainRows() {
 
     els.keychainTableBody.appendChild(tr);
   }
+  reapplySectionToolbarFor('section-create');
 }
 
 function refreshKeychainSelectOptions() {
@@ -906,6 +1303,7 @@ function renderTelegramStatusHint() {
 
   els.telegramStatusHint.textContent =
     `状态: ${configuredText}；控制: ${enabledText}；Polling: ${pollingText}；允许 chat: ${state.telegramAllowedChatIds.length}${errorText}`;
+  reapplySectionToolbarFor('section-telegram');
 }
 
 function renderTelegramChatsRows() {
@@ -918,6 +1316,7 @@ function renderTelegramChatsRows() {
     const tr = document.createElement('tr');
     tr.innerHTML = '<td colspan="6">暂无聊天记录。先给 Bot 发送 /start，再刷新配置。</td>';
     els.telegramChatsTableBody.appendChild(tr);
+    reapplySectionToolbarFor('section-telegram');
     return;
   }
 
@@ -950,6 +1349,7 @@ function renderTelegramChatsRows() {
 
     els.telegramChatsTableBody.appendChild(tr);
   }
+  reapplySectionToolbarFor('section-telegram');
 }
 
 function toggleTelegramAllowedChatId(chatId) {
@@ -978,7 +1378,7 @@ function toggleTelegramAllowedChatId(chatId) {
 }
 
 function parseChatIdsText(text) {
-  return normalizeChatIdList(String(text || '').split(','));
+  return normalizeChatIdList(String(text || '').split(/[\s,，;；]+/));
 }
 
 function normalizeChatIdList(items) {
@@ -987,12 +1387,15 @@ function normalizeChatIdList(items) {
   const list = Array.isArray(items) ? items : [items];
 
   for (const raw of list) {
-    const id = String(raw || '').trim();
-    if (!id || !/^-?\d+$/.test(id) || seen[id]) {
-      continue;
+    const tokens = String(raw || '').split(/[\s,，;；]+/);
+    for (const token of tokens) {
+      const id = String(token || '').trim();
+      if (!id || !/^-?\d+$/.test(id) || seen[id]) {
+        continue;
+      }
+      seen[id] = true;
+      out.push(id);
     }
-    seen[id] = true;
-    out.push(id);
   }
   return out;
 }
@@ -1227,6 +1630,7 @@ function renderVmRows(rows) {
     totalPages: page.totalPages,
     totalCount: page.totalCount
   });
+  reapplySectionToolbarFor('section-vms');
 }
 
 function populateResourceGroupFilter(rows) {
@@ -1353,6 +1757,7 @@ function updateTopChips(subscriptionId, location, filteredCount, totalCount) {
 function updateSizeMeta(source, count) {
   els.sizeSourceBadge.textContent = `规格来源: ${source || '-'}`;
   els.sizeCountBadge.textContent = `数量: ${count || 0}`;
+  reapplySectionToolbarFor('section-resources');
 }
 
 function updateLocationSelectionHint(location) {
@@ -1365,12 +1770,14 @@ function updateLocationSelectionHint(location) {
     els.locationSelectionHint.textContent = '当前地区: 未选择';
     els.locationSelectionHint.classList.remove('active');
     els.locationSelect.classList.remove('field-active');
+    reapplySectionToolbarFor('section-resources');
     return;
   }
 
   els.locationSelectionHint.textContent = `当前地区: ${text}（规格查询、创建 VM 均按此地区）`;
   els.locationSelectionHint.classList.add('active');
   els.locationSelect.classList.add('field-active');
+  reapplySectionToolbarFor('section-resources');
 }
 
 function deriveUiReadiness() {
@@ -1448,6 +1855,12 @@ function updateActionAvailability() {
   if (els.createVmSubmitBtn) {
     els.createVmSubmitBtn.disabled = !ready.canCreateVm;
   }
+  for (const toolbar of Object.values(state.sectionToolbars)) {
+    if (!toolbar || !toolbar.refreshBtn) {
+      continue;
+    }
+    toolbar.refreshBtn.disabled = !ready.authenticated;
+  }
 
   renderReadinessStatus(ready);
   updateActionHints(ready);
@@ -1524,6 +1937,8 @@ function updateActionHints(ready) {
       els.createActionHint.textContent = `已就绪: 可以创建虚拟机。${authTip} ${networkTip}`;
     }
   }
+  reapplySectionToolbarFor('section-resources');
+  reapplySectionToolbarFor('section-create');
 }
 
 function normalizeLocationKey(location) {
@@ -1714,6 +2129,7 @@ function renderAuditRows() {
     totalPages: page.totalPages,
     totalCount: page.totalCount
   });
+  reapplySectionToolbarFor('section-audit');
 }
 
 function clearVmTable(message) {
@@ -1729,6 +2145,7 @@ function clearVmTable(message) {
     totalPages: 1,
     totalCount: 0
   });
+  reapplySectionToolbarFor('section-vms');
 }
 
 function clearAuditTable(message) {
@@ -1744,6 +2161,7 @@ function clearAuditTable(message) {
     totalPages: 1,
     totalCount: 0
   });
+  reapplySectionToolbarFor('section-audit');
 }
 
 function formatDetails(details) {

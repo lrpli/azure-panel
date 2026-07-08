@@ -7,7 +7,39 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="shell">
+    <div id="loginView" class="login-view">
+      <div class="login-stage">
+        <section class="login-hero">
+          <p class="login-eyebrow">Azure Operations</p>
+          <h1>登录控制台</h1>
+          <p class="login-copy">统一管理 Azure VM 生命周期、Telegram 交互与审计记录。</p>
+          <ul class="login-points">
+            <li>集中创建、开关机、改规格和删除操作</li>
+            <li>按订阅和地区维度加载资源，减少误操作</li>
+            <li>全链路审计日志与请求记录可追溯</li>
+          </ul>
+        </section>
+
+        <section class="login-card">
+          <p class="login-card-title">管理员登录</p>
+          <h2>欢迎回来</h2>
+          <p class="login-card-desc">请先完成身份验证，登录后进入管理台。</p>
+          <form id="loginForm" class="form login-form">
+            <label>
+              用户名
+              <input name="username" required placeholder="admin" />
+            </label>
+            <label>
+              密码
+              <input name="password" type="password" required placeholder="输入管理密码" />
+            </label>
+            <button class="primary" type="submit">登录并进入管理台</button>
+          </form>
+        </section>
+      </div>
+    </div>
+
+    <div id="appShell" class="shell hidden">
       <aside class="sidebar">
         <div class="brand">
           <p class="brand-eyebrow">Operations</p>
@@ -47,6 +79,10 @@
               <span id="topVmCountChip">VM: 0</span>
             </div>
             <div class="topbar-actions">
+              <div class="density-switch" role="group" aria-label="界面密度">
+                <button id="densityComfortBtn" type="button">舒适</button>
+                <button id="densityCompactBtn" type="button">紧凑</button>
+              </div>
               <button id="refreshAllBtn" class="primary" type="button">刷新数据</button>
               <button id="logoutBtn" type="button">退出登录</button>
             </div>
@@ -91,23 +127,13 @@
           </article>
         </section>
 
-        <section class="card auth-card" id="auth-block">
-          <h3>登录</h3>
-          <p class="card-desc">先登录后才能调用 Azure 管理接口。</p>
-          <form id="loginForm" class="form auth-form">
-            <label>
-              用户名
-              <input name="username" required placeholder="admin" />
-            </label>
-            <label>
-              密码
-              <input name="password" type="password" required placeholder="输入管理密码" />
-            </label>
-            <button class="primary" type="submit">登录</button>
-          </form>
-        </section>
-
         <main id="appMain" class="content hidden">
+          <div class="section-pager wide">
+            <button id="sectionPrevBtn" type="button">上一页</button>
+            <span id="sectionPageInfo">第 1 / 1 页 · -</span>
+            <button id="sectionNextBtn" type="button">下一页</button>
+          </div>
+
           <section class="card" id="section-credentials">
             <h3>1. Azure 凭据</h3>
             <p class="card-desc">凭据仅存于当前进程内存，不写入数据库。</p>
