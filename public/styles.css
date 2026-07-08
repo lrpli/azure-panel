@@ -215,7 +215,7 @@ body {
 .insights-strip {
   margin-top: 12px;
   display: grid;
-  grid-template-columns: 1.2fr 1fr;
+  grid-template-columns: 1fr 1.2fr 1fr;
   gap: 12px;
 }
 
@@ -225,6 +225,10 @@ body {
   background: rgba(251, 253, 252, 0.92);
   box-shadow: var(--shadow-card);
   padding: 14px;
+}
+
+.guide-card {
+  border-top: 3px solid rgba(13, 93, 89, 0.7);
 }
 
 .request-card {
@@ -342,6 +346,35 @@ body {
   color: #9d3248;
   background: rgba(181, 59, 84, 0.12);
   border-color: rgba(181, 59, 84, 0.25);
+}
+
+.check-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.check-item {
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.check-item.done {
+  border-style: solid;
+  border-color: rgba(17, 122, 116, 0.35);
+  background: rgba(17, 122, 116, 0.09);
+  color: #0f5d58;
+  font-weight: 700;
+}
+
+.guide-hint {
+  margin-top: 10px;
 }
 
 .content {
@@ -487,10 +520,28 @@ button.danger {
   justify-content: space-between;
 }
 
+.inline-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.inline-form-actions select {
+  min-width: 280px;
+}
+
 .hint {
   margin: 0;
   color: var(--muted);
   font-size: 12px;
+}
+
+.info-hint {
+  border: 1px dashed var(--line);
+  border-radius: 11px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.72);
 }
 
 .location-hint {
@@ -555,6 +606,21 @@ button.danger {
   align-items: end;
 }
 
+.keychain-panel {
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.68);
+  padding: 10px;
+}
+
+.keychain-add-grid {
+  margin: 8px 0 10px;
+}
+
+.keychain-add-grid textarea {
+  min-height: 72px;
+}
+
 .inline-size-select {
   min-width: 210px;
 }
@@ -565,6 +631,39 @@ button.danger {
   border: 1px solid var(--line-soft);
   border-radius: 12px;
   background: #fff;
+}
+
+.compact-table-wrap table {
+  min-width: 720px;
+}
+
+.pager-row {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.pager-row span {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.pager-size {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pager-size select {
+  width: 84px;
+  padding: 6px 8px;
+  font-size: 12px;
 }
 
 table {

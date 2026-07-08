@@ -13,9 +13,15 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const PANEL_ADMIN_USERNAME = process.env.PANEL_ADMIN_USERNAME || 'admin';
 const PANEL_ADMIN_PASSWORD = process.env.PANEL_ADMIN_PASSWORD || 'admin123456';
 const SESSION_TTL_MS = Math.max(1, Number(process.env.SESSION_TTL_HOURS || 8)) * 60 * 60 * 1000;
+const MAX_JSON_BODY_BYTES = Math.max(1024, Number(process.env.MAX_JSON_BODY_BYTES || 1024 * 1024));
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || path.join(__dirname, 'audit.log');
 const AZURE_RUNTIME_CONFIG_PATH = process.env.AZURE_RUNTIME_CONFIG_PATH || path.join(__dirname, '.azure-runtime-config.json');
 const PERSIST_AZURE_CONFIG = String(process.env.PERSIST_AZURE_CONFIG || 'true').toLowerCase() !== 'false';
+const KEYCHAIN_PATH = process.env.KEYCHAIN_PATH || path.join(__dirname, '.keychain.json');
+const PERSIST_KEYCHAIN = String(process.env.PERSIST_KEYCHAIN || 'true').toLowerCase() !== 'false';
+const TELEGRAM_RUNTIME_CONFIG_PATH = process.env.TELEGRAM_RUNTIME_CONFIG_PATH || path.join(__dirname, '.telegram-runtime-config.json');
+const PERSIST_TELEGRAM_CONFIG = String(process.env.PERSIST_TELEGRAM_CONFIG || 'true').toLowerCase() !== 'false';
+const POWER_STATE_CACHE_TTL_MS = Math.max(0, Number(process.env.POWER_STATE_CACHE_TTL_MS || 15_000));
 const fetchImpl = typeof global.fetch === 'function' ? global.fetch.bind(global) : createCompatFetch();
 
 const runtimeConfig = {
@@ -29,9 +35,26 @@ let tokenCache = {
   expiresAtMs: 0
 };
 
+const telegramRuntimeConfig = {
+  botToken: String(process.env.TELEGRAM_BOT_TOKEN || '').trim(),
+  enabled: String(process.env.TELEGRAM_ENABLED || 'false').toLowerCase() === 'true',
+  allowedChatIds: parseTelegramAllowedChatIds(process.env.TELEGRAM_ALLOWED_CHAT_IDS || '')
+};
+
+const telegramState = {
+  knownChats: [],
+  lastUpdateId: 0,
+  pollerVersion: 0,
+  pollerRunning: false,
+  lastError: ''
+};
+
 const sessions = new Map();
 const auditEntries = [];
+const keychainEntries = [];
+const vmPowerStateCache = new Map();
 const MAX_AUDIT_ENTRIES = 1000;
+const MAX_KEYCHAIN_ENTRIES = 300;
 
 const IMAGE_OPTIONS = [
   {
@@ -76,6 +99,9 @@ const DEFAULT_REGIONS = [
 
 loadRuntimeConfigFromDisk();
 loadAuditEntries();
+loadKeychainFromDisk();
+loadTelegramConfigFromDisk();
+restartTelegramPoller();
 
 const server = http.createServer(async (req, res) => {
   let url = null;
@@ -83,6 +109,7 @@ const server = http.createServer(async (req, res) => {
   let ip = '';
   try {
     pruneExpiredSessions();
+    pruneVmPowerStateCache();
     url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     ip = getClientIp(req);
     const session = getSession(req);
@@ -207,6 +234,132 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { images: IMAGE_OPTIONS });
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/keychain') {
+      return sendJson(res, 200, {
+        entries: keychainEntries.map(toClientKeychainEntry)
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/keychain') {
+      const body = await readJsonBody(req);
+      const type = normalizeKeychainType(body.type);
+      const name = required(body.name, 'name');
+      const value = required(body.value, 'value');
+
+      validateKeychainValue(type, value);
+
+      if (keychainEntries.length >= MAX_KEYCHAIN_ENTRIES) {
+        return sendJson(res, 400, { error: `Keychain capacity exceeded. Max ${MAX_KEYCHAIN_ENTRIES} entries.` });
+      }
+
+      const nowIso = new Date().toISOString();
+      const entry = {
+        id: createEntityId(),
+        type,
+        name: sanitizeKeychainName(name),
+        value: String(value).trim(),
+        createdAt: nowIso,
+        updatedAt: nowIso
+      };
+      keychainEntries.unshift(entry);
+      persistKeychainToDisk();
+
+      recordAudit({
+        action: 'keychain.create',
+        success: true,
+        actor,
+        ip,
+        details: {
+          keychainId: entry.id,
+          type: entry.type,
+          name: entry.name
+        }
+      });
+
+      return sendJson(res, 200, { ok: true, entry: toClientKeychainEntry(entry) });
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/api/keychain') {
+      const body = await readJsonBody(req);
+      const id = required(body.id, 'id');
+      const idx = keychainEntries.findIndex((x) => x && x.id === id);
+      if (idx < 0) {
+        return sendJson(res, 404, { error: 'Keychain entry not found.' });
+      }
+
+      const removed = keychainEntries.splice(idx, 1)[0];
+      persistKeychainToDisk();
+
+      recordAudit({
+        action: 'keychain.delete',
+        success: true,
+        actor,
+        ip,
+        details: {
+          keychainId: removed.id,
+          type: removed.type,
+          name: removed.name
+        }
+      });
+
+      return sendJson(res, 200, { ok: true, id: removed.id });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/telegram/config') {
+      return sendJson(res, 200, buildTelegramConfigResponse());
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/telegram/chats') {
+      return sendJson(res, 200, {
+        chats: telegramState.knownChats.map(toClientTelegramChat),
+        allowedChatIds: [...telegramRuntimeConfig.allowedChatIds]
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/telegram/config') {
+      const body = await readJsonBody(req);
+      let nextBotToken = telegramRuntimeConfig.botToken;
+      let nextAllowedChatIds = telegramRuntimeConfig.allowedChatIds;
+      let nextEnabled = telegramRuntimeConfig.enabled;
+
+      if (Object.prototype.hasOwnProperty.call(body, 'botToken')) {
+        nextBotToken = String(body.botToken || '').trim();
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, 'allowedChatIds')) {
+        nextAllowedChatIds = normalizeTelegramAllowedChatIds(body.allowedChatIds);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, 'enabled')) {
+        nextEnabled = Boolean(body.enabled);
+      }
+
+      if (nextEnabled && !nextBotToken) {
+        return sendJson(res, 400, { error: 'botToken is required when telegram bot is enabled.' });
+      }
+
+      telegramRuntimeConfig.botToken = nextBotToken;
+      telegramRuntimeConfig.allowedChatIds = nextAllowedChatIds;
+      telegramRuntimeConfig.enabled = nextEnabled;
+
+      persistTelegramConfigToDisk();
+      restartTelegramPoller();
+
+      recordAudit({
+        action: 'telegram.config.update',
+        success: true,
+        actor,
+        ip,
+        details: {
+          enabled: telegramRuntimeConfig.enabled,
+          hasToken: Boolean(telegramRuntimeConfig.botToken),
+          allowedChatCount: telegramRuntimeConfig.allowedChatIds.length
+        }
+      });
+
+      return sendJson(res, 200, buildTelegramConfigResponse());
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/audit') {
       const limitRaw = Number(url.searchParams.get('limit') || 100);
       const limit = Math.max(1, Math.min(Number.isFinite(limitRaw) ? limitRaw : 100, 500));
@@ -260,23 +413,7 @@ const server = http.createServer(async (req, res) => {
 
       const vms = await mapWithConcurrency(list.value || [], 5, async (vm) => {
         const parts = parseResourceId(vm.id || '');
-        let powerState = 'unknown';
-
-        if (parts.resourceGroup && parts.name) {
-          try {
-            const iv = await azureRequest({
-              method: 'GET',
-              url: `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/resourceGroups/${encodeURIComponent(parts.resourceGroup)}/providers/Microsoft.Compute/virtualMachines/${encodeURIComponent(parts.name)}/instanceView?api-version=2024-03-01`
-            });
-
-            const status = (iv.statuses || []).find((s) => (s.code || '').startsWith('PowerState/'));
-            if (status && status.code) {
-              powerState = status.code.replace('PowerState/', '');
-            }
-          } catch (e) {
-            powerState = 'unknown';
-          }
-        }
+        const powerState = await resolveVmPowerState(subscriptionId, vm, parts);
 
         return {
           id: vm.id,
@@ -437,7 +574,19 @@ const server = http.createServer(async (req, res) => {
 
       const authType = body.authType === 'ssh' ? 'ssh' : 'password';
       const adminPassword = String(body.adminPassword || '');
-      const sshPublicKey = String(body.sshPublicKey || '');
+      const keychainId = String(body.keychainId || '').trim();
+      let sshPublicKey = String(body.sshPublicKey || '').trim();
+
+      if (authType === 'ssh' && !sshPublicKey && keychainId) {
+        const keychainEntry = findKeychainEntryById(keychainId);
+        if (!keychainEntry) {
+          return sendJson(res, 400, { error: 'keychainId not found.' });
+        }
+        if (keychainEntry.type !== 'ssh-public-key') {
+          return sendJson(res, 400, { error: 'keychainId type is not ssh-public-key.' });
+        }
+        sshPublicKey = keychainEntry.value;
+      }
 
       if (authType === 'password' && adminPassword.length < 12) {
         return sendJson(res, 400, { error: 'adminPassword must be at least 12 characters when using password auth.' });
@@ -618,7 +767,7 @@ const server = http.createServer(async (req, res) => {
         success: true,
         actor,
         ip,
-        details: { subscriptionId, resourceGroup, name, location, vmSize, imageId, networkMode }
+        details: { subscriptionId, resourceGroup, name, location, vmSize, imageId, networkMode, authType, keychainId: keychainId || '' }
       });
       return sendJson(res, 200, {
         ok: true,
@@ -744,6 +893,721 @@ function persistRuntimeConfigToDisk() {
   }
 }
 
+function loadKeychainFromDisk() {
+  if (!PERSIST_KEYCHAIN) {
+    return;
+  }
+
+  if (!fs.existsSync(KEYCHAIN_PATH)) {
+    return;
+  }
+
+  try {
+    const raw = fs.readFileSync(KEYCHAIN_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed && parsed.entries) ? parsed.entries : [];
+    const normalized = [];
+
+    for (const item of list) {
+      if (!item || typeof item !== 'object') {
+        continue;
+      }
+
+      const type = normalizeKeychainType(item.type);
+      const name = sanitizeKeychainName(item.name || '');
+      const value = String(item.value || '').trim();
+      if (!name || !value) {
+        continue;
+      }
+
+      try {
+        validateKeychainValue(type, value);
+      } catch {
+        continue;
+      }
+
+      normalized.push({
+        id: String(item.id || createEntityId()),
+        type,
+        name,
+        value,
+        createdAt: String(item.createdAt || new Date().toISOString()),
+        updatedAt: String(item.updatedAt || new Date().toISOString())
+      });
+    }
+
+    keychainEntries.length = 0;
+    for (const item of normalized.slice(0, MAX_KEYCHAIN_ENTRIES)) {
+      keychainEntries.push(item);
+    }
+  } catch {
+    // Ignore broken keychain files.
+  }
+}
+
+function persistKeychainToDisk() {
+  if (!PERSIST_KEYCHAIN) {
+    return;
+  }
+
+  const payload = {
+    entries: keychainEntries.map((item) => ({
+      id: item.id,
+      type: item.type,
+      name: item.name,
+      value: item.value,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt
+    }))
+  };
+
+  try {
+    fs.writeFileSync(KEYCHAIN_PATH, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    try {
+      fs.chmodSync(KEYCHAIN_PATH, 0o600);
+    } catch {
+      // Ignore chmod failures on limited filesystems.
+    }
+  } catch {
+    // Persistence is best-effort and should not break API response flow.
+  }
+}
+
+function findKeychainEntryById(id) {
+  const target = String(id || '').trim();
+  if (!target) {
+    return null;
+  }
+
+  for (const item of keychainEntries) {
+    if (item && item.id === target) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function toClientKeychainEntry(item) {
+  return {
+    id: item.id,
+    type: item.type,
+    name: item.name,
+    value: item.value,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt
+  };
+}
+
+function normalizeKeychainType(type) {
+  const value = String(type || '').trim().toLowerCase();
+  return value === 'ssh-public-key' ? value : 'ssh-public-key';
+}
+
+function sanitizeKeychainName(name) {
+  const out = String(name || '').trim().replace(/\s+/g, ' ');
+  return out.slice(0, 120);
+}
+
+function validateKeychainValue(type, value) {
+  const trimmed = String(value || '').trim();
+  if (!trimmed) {
+    const err = new Error('value is required.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (type === 'ssh-public-key') {
+    if (trimmed.length < 40 || !/^(ssh-|ecdsa-|sk-ssh-|sk-ecdsa-)/.test(trimmed)) {
+      const err = new Error('Invalid ssh public key format.');
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+}
+
+function parseTelegramAllowedChatIds(raw) {
+  return normalizeTelegramAllowedChatIds(raw);
+}
+
+function normalizeTelegramAllowedChatIds(value) {
+  const list = Array.isArray(value)
+    ? value
+    : String(value || '').split(',');
+
+  const out = [];
+  const seen = {};
+  for (const item of list) {
+    const id = String(item || '').trim();
+    if (!id || !/^-?\d+$/.test(id)) {
+      continue;
+    }
+    if (seen[id]) {
+      continue;
+    }
+    seen[id] = true;
+    out.push(id);
+  }
+  return out;
+}
+
+function loadTelegramConfigFromDisk() {
+  if (!PERSIST_TELEGRAM_CONFIG) {
+    return;
+  }
+
+  if (!fs.existsSync(TELEGRAM_RUNTIME_CONFIG_PATH)) {
+    return;
+  }
+
+  try {
+    const raw = fs.readFileSync(TELEGRAM_RUNTIME_CONFIG_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    if (!telegramRuntimeConfig.botToken) {
+      telegramRuntimeConfig.botToken = String(parsed.botToken || '').trim();
+    }
+    if (!telegramRuntimeConfig.allowedChatIds.length) {
+      telegramRuntimeConfig.allowedChatIds = normalizeTelegramAllowedChatIds(parsed.allowedChatIds || []);
+    }
+    if (!telegramRuntimeConfig.enabled && parsed && typeof parsed.enabled === 'boolean') {
+      telegramRuntimeConfig.enabled = Boolean(parsed.enabled);
+    }
+
+    const knownChats = Array.isArray(parsed && parsed.knownChats) ? parsed.knownChats : [];
+    for (const chat of knownChats) {
+      if (!chat || typeof chat !== 'object') {
+        continue;
+      }
+      const chatId = String(chat.id || '').trim();
+      if (!chatId || !/^-?\d+$/.test(chatId)) {
+        continue;
+      }
+      telegramState.knownChats.push({
+        id: chatId,
+        type: String(chat.type || ''),
+        title: String(chat.title || ''),
+        username: String(chat.username || ''),
+        firstSeenAt: String(chat.firstSeenAt || new Date().toISOString()),
+        lastSeenAt: String(chat.lastSeenAt || new Date().toISOString())
+      });
+    }
+
+    telegramState.lastUpdateId = Math.max(0, Number(parsed.lastUpdateId || 0));
+  } catch {
+    // Ignore broken telegram config files.
+  }
+}
+
+function persistTelegramConfigToDisk() {
+  if (!PERSIST_TELEGRAM_CONFIG) {
+    return;
+  }
+
+  const payload = {
+    botToken: telegramRuntimeConfig.botToken,
+    enabled: telegramRuntimeConfig.enabled,
+    allowedChatIds: [...telegramRuntimeConfig.allowedChatIds],
+    knownChats: telegramState.knownChats.map((x) => ({
+      id: x.id,
+      type: x.type,
+      title: x.title,
+      username: x.username,
+      firstSeenAt: x.firstSeenAt,
+      lastSeenAt: x.lastSeenAt
+    })),
+    lastUpdateId: telegramState.lastUpdateId
+  };
+
+  try {
+    fs.writeFileSync(TELEGRAM_RUNTIME_CONFIG_PATH, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+    try {
+      fs.chmodSync(TELEGRAM_RUNTIME_CONFIG_PATH, 0o600);
+    } catch {
+      // Ignore chmod failures on limited filesystems.
+    }
+  } catch {
+    // Persistence is best-effort and should not break API response flow.
+  }
+}
+
+function maskTelegramToken(token) {
+  const text = String(token || '').trim();
+  if (!text) {
+    return '';
+  }
+  if (text.length <= 10) {
+    return '******';
+  }
+  return `${text.slice(0, 6)}...${text.slice(-4)}`;
+}
+
+function buildTelegramConfigResponse() {
+  return {
+    configured: Boolean(telegramRuntimeConfig.botToken),
+    hasToken: Boolean(telegramRuntimeConfig.botToken),
+    tokenPreview: maskTelegramToken(telegramRuntimeConfig.botToken),
+    enabled: Boolean(telegramRuntimeConfig.enabled),
+    polling: Boolean(telegramState.pollerRunning),
+    allowedChatIds: [...telegramRuntimeConfig.allowedChatIds],
+    knownChats: telegramState.knownChats.map(toClientTelegramChat),
+    persisted: PERSIST_TELEGRAM_CONFIG,
+    lastError: telegramState.lastError || ''
+  };
+}
+
+function toClientTelegramChat(chat) {
+  return {
+    id: chat.id,
+    type: chat.type,
+    title: chat.title,
+    username: chat.username,
+    firstSeenAt: chat.firstSeenAt,
+    lastSeenAt: chat.lastSeenAt,
+    authorized: isTelegramChatAllowed(chat.id)
+  };
+}
+
+function isTelegramChatAllowed(chatId) {
+  const target = String(chatId || '').trim();
+  if (!target) {
+    return false;
+  }
+  return telegramRuntimeConfig.allowedChatIds.includes(target);
+}
+
+function upsertTelegramKnownChat(chat) {
+  const chatId = String(chat && chat.id ? chat.id : '').trim();
+  if (!chatId) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  const type = String(chat && chat.type ? chat.type : '');
+  const username = String(chat && chat.username ? chat.username : '');
+  const title =
+    String(chat && chat.title ? chat.title : '') ||
+    [String(chat && chat.first_name ? chat.first_name : ''), String(chat && chat.last_name ? chat.last_name : '')].join(' ').trim() ||
+    username ||
+    chatId;
+
+  const existing = telegramState.knownChats.find((x) => x && x.id === chatId);
+  if (existing) {
+    existing.type = type;
+    existing.username = username;
+    existing.title = title;
+    existing.lastSeenAt = nowIso;
+    return;
+  }
+
+  telegramState.knownChats.unshift({
+    id: chatId,
+    type,
+    title,
+    username,
+    firstSeenAt: nowIso,
+    lastSeenAt: nowIso
+  });
+
+  if (telegramState.knownChats.length > 500) {
+    telegramState.knownChats.length = 500;
+  }
+}
+
+function restartTelegramPoller() {
+  telegramState.pollerVersion += 1;
+  telegramState.pollerRunning = false;
+
+  if (!telegramRuntimeConfig.enabled || !telegramRuntimeConfig.botToken) {
+    telegramState.lastError = '';
+    return;
+  }
+
+  const version = telegramState.pollerVersion;
+  runTelegramPoller(version).catch(() => {
+    // Polling loop handles retries internally.
+  });
+}
+
+async function runTelegramPoller(version) {
+  if (!telegramRuntimeConfig.enabled || !telegramRuntimeConfig.botToken) {
+    return;
+  }
+
+  telegramState.pollerRunning = true;
+  telegramState.lastError = '';
+
+  while (
+    version === telegramState.pollerVersion &&
+    telegramRuntimeConfig.enabled &&
+    telegramRuntimeConfig.botToken
+  ) {
+    try {
+      const updates = await telegramApiRequest('getUpdates', {
+        timeout: 25,
+        offset: telegramState.lastUpdateId + 1,
+        allowed_updates: ['message']
+      });
+
+      for (const update of updates) {
+        if (update && Number.isFinite(Number(update.update_id))) {
+          telegramState.lastUpdateId = Math.max(telegramState.lastUpdateId, Number(update.update_id));
+        }
+        await handleTelegramUpdate(update);
+      }
+
+      if (updates.length) {
+        persistTelegramConfigToDisk();
+      }
+    } catch (err) {
+      telegramState.lastError = err && err.message ? err.message : 'Telegram polling failed.';
+      await sleep(3000);
+    }
+  }
+
+  if (version === telegramState.pollerVersion) {
+    telegramState.pollerRunning = false;
+  }
+}
+
+async function handleTelegramUpdate(update) {
+  const message = update && update.message ? update.message : null;
+  if (!message || !message.chat) {
+    return;
+  }
+
+  upsertTelegramKnownChat(message.chat);
+
+  const chatId = String(message.chat.id || '').trim();
+  if (!chatId) {
+    return;
+  }
+
+  const text = String(message.text || '').trim();
+  if (!text.startsWith('/')) {
+    return;
+  }
+
+  const command = parseTelegramCommand(text);
+  const actor = `telegram:${chatId}`;
+
+  if (command.name === '/start' || command.name === '/chatid') {
+    await sendTelegramMessage(chatId, `chatId: ${chatId}\n请在面板 Telegram 配置中加入允许列表后再执行控制命令。`);
+    return;
+  }
+
+  if (!isTelegramChatAllowed(chatId)) {
+    await sendTelegramMessage(chatId, `未授权。\n请在面板中将 chatId ${chatId} 添加到允许列表。`);
+    recordAudit({
+      action: 'telegram.command.denied',
+      success: false,
+      actor,
+      ip: '',
+      details: { chatId, command: command.name }
+    });
+    return;
+  }
+
+  try {
+    const resultText = await executeTelegramCommand({ chatId, command });
+    if (resultText) {
+      await sendTelegramMessage(chatId, resultText);
+    }
+  } catch (err) {
+    const messageText = err && err.message ? err.message : 'Unknown error.';
+    await sendTelegramMessage(chatId, `执行失败: ${messageText}`);
+    recordAudit({
+      action: 'telegram.command.error',
+      success: false,
+      actor,
+      ip: '',
+      details: { chatId, command: command.name, message: messageText }
+    });
+  } finally {
+    persistTelegramConfigToDisk();
+  }
+}
+
+function parseTelegramCommand(text) {
+  const parts = String(text || '').trim().split(/\s+/);
+  const rawName = String(parts[0] || '').toLowerCase();
+  const name = rawName.split('@')[0];
+  return {
+    name,
+    args: parts.slice(1)
+  };
+}
+
+async function executeTelegramCommand({ chatId, command }) {
+  const actor = `telegram:${chatId}`;
+  const args = command.args || [];
+
+  if (command.name === '/help') {
+    return [
+      '可用命令:',
+      '/chatid',
+      '/subscriptions',
+      '/vms <subscriptionId> [keyword]',
+      '/startvm <subscriptionId> <resourceGroup> <name>',
+      '/stopvm <subscriptionId> <resourceGroup> <name>',
+      '/restartvm <subscriptionId> <resourceGroup> <name>',
+      '/deallocatevm <subscriptionId> <resourceGroup> <name>',
+      '/resizevm <subscriptionId> <resourceGroup> <name> <vmSize>',
+      '/deletevm <subscriptionId> <resourceGroup> <name> confirm',
+      '/status'
+    ].join('\n');
+  }
+
+  if (command.name === '/status') {
+    return [
+      `Bot: ${telegramRuntimeConfig.enabled ? 'enabled' : 'disabled'}`,
+      `Polling: ${telegramState.pollerRunning ? 'running' : 'stopped'}`,
+      `Allowed Chats: ${telegramRuntimeConfig.allowedChatIds.length}`,
+      `Azure Configured: ${hasRuntimeConfig() ? 'yes' : 'no'}`
+    ].join('\n');
+  }
+
+  if (command.name === '/subscriptions') {
+    const payload = await azureRequest({
+      method: 'GET',
+      url: 'https://management.azure.com/subscriptions?api-version=2022-12-01'
+    });
+    const items = Array.isArray(payload.value) ? payload.value : [];
+    if (!items.length) {
+      return '未查询到订阅。';
+    }
+
+    const lines = ['订阅列表:'];
+    for (const item of items.slice(0, 30)) {
+      lines.push(`- ${item.displayName || '-'} | ${item.subscriptionId || '-'} | ${item.state || '-'}`);
+    }
+    if (items.length > 30) {
+      lines.push(`...共 ${items.length} 条，仅展示前 30 条`);
+    }
+    return lines.join('\n');
+  }
+
+  if (command.name === '/vms') {
+    const subscriptionId = required(args[0], 'subscriptionId');
+    const keyword = String(args[1] || '').trim().toLowerCase();
+
+    const list = await azureRequest({
+      method: 'GET',
+      url: `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/providers/Microsoft.Compute/virtualMachines?api-version=2024-03-01`
+    });
+
+    let vms = Array.isArray(list.value) ? list.value : [];
+    if (keyword) {
+      vms = vms.filter((x) => String(x && x.name ? x.name : '').toLowerCase().includes(keyword));
+    }
+    if (!vms.length) {
+      return '未查询到虚拟机。';
+    }
+
+    const selected = vms.slice(0, 20);
+    const enriched = await mapWithConcurrency(selected, 4, async (vm) => {
+      const parts = parseResourceId(vm.id || '');
+      const powerState = await resolveVmPowerState(subscriptionId, vm, parts);
+      return {
+        name: vm.name || '-',
+        resourceGroup: parts.resourceGroup || '-',
+        vmSize: readVmSize(vm) || '-',
+        location: vm.location || '-',
+        powerState
+      };
+    });
+
+    const lines = ['虚拟机列表:'];
+    for (const vm of enriched) {
+      lines.push(`- ${vm.name} | ${vm.resourceGroup} | ${vm.location} | ${vm.vmSize} | ${vm.powerState}`);
+    }
+    if (vms.length > selected.length) {
+      lines.push(`...共 ${vms.length} 台，仅展示前 ${selected.length} 台`);
+    }
+    return lines.join('\n');
+  }
+
+  if (
+    command.name === '/startvm' ||
+    command.name === '/stopvm' ||
+    command.name === '/restartvm' ||
+    command.name === '/deallocatevm' ||
+    command.name === '/deletevm' ||
+    command.name === '/resizevm'
+  ) {
+    const subscriptionId = required(args[0], 'subscriptionId');
+    const resourceGroup = required(args[1], 'resourceGroup');
+    const name = required(args[2], 'name');
+
+    if (command.name === '/deletevm') {
+      const confirm = String(args[3] || '').trim().toLowerCase();
+      if (confirm !== 'confirm') {
+        return '删除命令需要确认: /deletevm <subscriptionId> <resourceGroup> <name> confirm';
+      }
+    }
+
+    let action = 'start';
+    let vmSize = '';
+    if (command.name === '/startvm') {
+      action = 'start';
+    } else if (command.name === '/stopvm') {
+      action = 'powerOff';
+    } else if (command.name === '/restartvm') {
+      action = 'restart';
+    } else if (command.name === '/deallocatevm') {
+      action = 'deallocate';
+    } else if (command.name === '/deletevm') {
+      action = 'delete';
+    } else if (command.name === '/resizevm') {
+      action = 'resize';
+      vmSize = required(args[3], 'vmSize');
+    }
+
+    const result = await executeTelegramVmAction({
+      subscriptionId,
+      resourceGroup,
+      name,
+      action,
+      vmSize,
+      actor
+    });
+    return result;
+  }
+
+  return `不支持的命令: ${command.name}。\n发送 /help 查看可用命令。`;
+}
+
+async function executeTelegramVmAction({ subscriptionId, resourceGroup, name, action, vmSize, actor }) {
+  const baseUrl = `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/resourceGroups/${encodeURIComponent(resourceGroup)}/providers/Microsoft.Compute/virtualMachines/${encodeURIComponent(name)}`;
+  const vmUrl = `${baseUrl}?api-version=2024-03-01`;
+
+  if (action === 'delete') {
+    await azureLroRequest({
+      method: 'DELETE',
+      url: vmUrl
+    });
+    recordAudit({
+      action: 'vm.delete.telegram',
+      success: true,
+      actor,
+      ip: '',
+      details: { subscriptionId, resourceGroup, name }
+    });
+    return `删除任务已提交: ${name}`;
+  }
+
+  if (action === 'resize') {
+    const targetSize = required(vmSize, 'vmSize');
+    await azureLroRequest({
+      method: 'PATCH',
+      url: vmUrl,
+      body: {
+        properties: {
+          hardwareProfile: {
+            vmSize: targetSize
+          }
+        }
+      }
+    });
+    recordAudit({
+      action: 'vm.resize.telegram',
+      success: true,
+      actor,
+      ip: '',
+      details: { subscriptionId, resourceGroup, name, vmSize: targetSize }
+    });
+    return `改规格任务已提交: ${name} -> ${targetSize}`;
+  }
+
+  await azureLroRequest({
+    method: 'POST',
+    url: `${baseUrl}/${action}?api-version=2024-03-01`,
+    body: {}
+  });
+  recordAudit({
+    action: `vm.${action}.telegram`,
+    success: true,
+    actor,
+    ip: '',
+    details: { subscriptionId, resourceGroup, name }
+  });
+  return `操作已提交: ${name} -> ${action}`;
+}
+
+async function telegramApiRequest(method, payload = {}) {
+  const botToken = String(telegramRuntimeConfig.botToken || '').trim();
+  if (!botToken) {
+    throw new Error('Telegram bot token is not configured.');
+  }
+
+  const response = await fetchImpl(`https://api.telegram.org/bot${botToken}/${method}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload || {})
+  });
+
+  const text = await response.text();
+  const json = safeJsonParse(text);
+  if (!response.ok) {
+    const message = json && json.description ? json.description : `Telegram API failed with status ${response.status}.`;
+    throw new Error(message);
+  }
+
+  if (!json || json.ok !== true) {
+    const message = json && json.description ? json.description : 'Telegram API returned non-ok.';
+    throw new Error(message);
+  }
+
+  return json.result;
+}
+
+async function sendTelegramMessage(chatId, text) {
+  const chunks = splitTelegramText(text, 3500);
+  for (const chunk of chunks) {
+    await telegramApiRequest('sendMessage', {
+      chat_id: chatId,
+      text: chunk
+    });
+  }
+}
+
+function splitTelegramText(text, limit) {
+  const out = [];
+  const source = String(text || '');
+  if (!source) {
+    return [''];
+  }
+
+  let current = '';
+  for (const line of source.split('\n')) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length <= limit) {
+      current = candidate;
+      continue;
+    }
+
+    if (current) {
+      out.push(current);
+      current = '';
+    }
+
+    if (line.length <= limit) {
+      current = line;
+      continue;
+    }
+
+    for (let i = 0; i < line.length; i += limit) {
+      out.push(line.slice(i, i + limit));
+    }
+  }
+
+  if (current) {
+    out.push(current);
+  }
+  return out.length ? out : [''];
+}
+
 function mustQuery(url, key) {
   const value = (url.searchParams.get(key) || '').trim();
   if (!value) {
@@ -765,8 +1629,22 @@ function required(value, name) {
 }
 
 async function readJsonBody(req) {
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_JSON_BODY_BYTES) {
+    const err = new Error(`JSON body is too large. Max ${MAX_JSON_BODY_BYTES} bytes.`);
+    err.statusCode = 413;
+    throw err;
+  }
+
   const chunks = [];
+  let totalBytes = 0;
   for await (const chunk of req) {
+    totalBytes += chunk.length;
+    if (totalBytes > MAX_JSON_BODY_BYTES) {
+      const err = new Error(`JSON body is too large. Max ${MAX_JSON_BODY_BYTES} bytes.`);
+      err.statusCode = 413;
+      throw err;
+    }
     chunks.push(chunk);
   }
 
@@ -790,7 +1668,7 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
     'Cache-Control': 'no-store',
     ...extraHeaders
   });
-  res.end(JSON.stringify(payload, null, 2));
+  res.end(JSON.stringify(payload));
 }
 
 function isPublicApi(pathname) {
@@ -822,7 +1700,11 @@ function parseCookies(req) {
     }
     const key = item.slice(0, idx).trim();
     const value = item.slice(idx + 1).trim();
-    out[key] = decodeURIComponent(value);
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      out[key] = value;
+    }
   }
   return out;
 }
@@ -926,6 +1808,10 @@ function recordAudit({ action, success, actor, ip, details }) {
 }
 
 function createAuditId() {
+  return createEntityId();
+}
+
+function createEntityId() {
   if (typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
@@ -937,6 +1823,82 @@ function readVmSize(vmInfo) {
     return '';
   }
   return String(vmInfo.properties.hardwareProfile.vmSize || '').trim();
+}
+
+async function resolveVmPowerState(subscriptionId, vm, parts) {
+  const cacheKey = buildVmPowerStateCacheKey(subscriptionId, vm);
+  const cached = getCachedVmPowerState(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  if (!parts.resourceGroup || !parts.name) {
+    return 'unknown';
+  }
+
+  try {
+    const iv = await azureRequest({
+      method: 'GET',
+      url: `https://management.azure.com/subscriptions/${encodeURIComponent(subscriptionId)}/resourceGroups/${encodeURIComponent(parts.resourceGroup)}/providers/Microsoft.Compute/virtualMachines/${encodeURIComponent(parts.name)}/instanceView?api-version=2024-03-01`
+    });
+
+    const status = (iv.statuses || []).find((s) => (s.code || '').startsWith('PowerState/'));
+    const powerState = status && status.code ? status.code.replace('PowerState/', '') : 'unknown';
+    setCachedVmPowerState(cacheKey, powerState);
+    return powerState;
+  } catch {
+    return 'unknown';
+  }
+}
+
+function buildVmPowerStateCacheKey(subscriptionId, vm) {
+  const vmId = String(vm && vm.id ? vm.id : '').trim().toLowerCase();
+  if (!subscriptionId || !vmId) {
+    return '';
+  }
+  return `${String(subscriptionId).trim().toLowerCase()}::${vmId}`;
+}
+
+function getCachedVmPowerState(cacheKey) {
+  if (!POWER_STATE_CACHE_TTL_MS || !cacheKey) {
+    return '';
+  }
+
+  const item = vmPowerStateCache.get(cacheKey);
+  if (!item) {
+    return '';
+  }
+
+  if (item.expiresAtMs <= Date.now()) {
+    vmPowerStateCache.delete(cacheKey);
+    return '';
+  }
+
+  return item.value;
+}
+
+function setCachedVmPowerState(cacheKey, powerState) {
+  if (!POWER_STATE_CACHE_TTL_MS || !cacheKey || !powerState) {
+    return;
+  }
+
+  vmPowerStateCache.set(cacheKey, {
+    value: String(powerState),
+    expiresAtMs: Date.now() + POWER_STATE_CACHE_TTL_MS
+  });
+}
+
+function pruneVmPowerStateCache() {
+  if (!vmPowerStateCache.size) {
+    return;
+  }
+
+  const now = Date.now();
+  for (const [key, item] of vmPowerStateCache.entries()) {
+    if (!item || item.expiresAtMs <= now) {
+      vmPowerStateCache.delete(key);
+    }
+  }
 }
 
 async function getVmSizes(subscriptionId, location) {
